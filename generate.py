@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import os
 import re
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
@@ -19,7 +21,13 @@ from urllib.request import Request, urlopen
 
 USER_AGENT = "WikipediaArticlePdfGenerator/1.0 (https://github.com/your-name/wikipedia-pdf-generator; personal use)"
 MAX_RETRIES = 5
+CACHE_MAX_AGE_SECONDS = 31 * 24 * 60 * 60
+CACHE_DIR = Path(".wikipedia-cache")
+MEDIA_CACHE_DIR = Path(".wikipedia-media-cache")
+DEFAULT_REQUEST_DELAY = 1.0
 SKIP_NAMESPACES = {"category", "file", "help", "special", "template", "talk", "portal", "wikipedia", "module", "book", "draft", "mediawiki", "timedtext", "topic", "user", "education program", "gadget", "gadget definition"}
+SUPPORTED_TAGS = {"p", "br", "hr", "b", "i", "s", "u", "font", "center", "a", "pre", "code", "ol", "ul", "li", "dl", "dt", "dd", "table", "thead", "tbody", "tfoot", "tr", "th", "td", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "sup", "sub", "img"}
+VOID_TAGS = {"br", "hr", "img"}
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -74,7 +82,46 @@ def safe_filename(title: str) -> str:
     return (re.sub(r"\s+", " ", cleaned).strip(" .") or "article")[:180] + ".pdf"
 
 
-def fetch_article(url: str) -> str:
+def clean_response_cache(cache_dir: Path, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for cache_file in cache_dir.glob("*.html"):
+        try:
+            if now - cache_file.stat().st_mtime > CACHE_MAX_AGE_SECONDS:
+                cache_file.unlink()
+        except FileNotFoundError:
+            continue
+
+
+def fetch_media(url: str, cache_dir: Path = MEDIA_CACHE_DIR) -> Path:
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}:
+        suffix = ".bin"
+    cache_file = cache_dir / f"{hashlib.sha256(url.encode('utf-8')).hexdigest()}{suffix}"
+    if cache_file.exists() and time.time() - cache_file.stat().st_mtime <= CACHE_MAX_AGE_SECONDS:
+        return cache_file
+    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"})
+    with urlopen(request, timeout=30) as response:  # noqa: S310
+        data = response.read()
+    content_type = response.headers.get_content_type()
+    if content_type not in {"image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"}:
+        raise ValueError(f"unexpected image content type: {content_type}")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    temporary_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
+    temporary_file.write_bytes(data)
+    temporary_file.replace(cache_file)
+    return cache_file
+
+
+def fetch_article(url: str, cache_dir: Path = CACHE_DIR) -> tuple[str, bool]:
+    cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    cache_file = cache_dir / f"{cache_key}.html"
+    try:
+        if time.time() - cache_file.stat().st_mtime <= CACHE_MAX_AGE_SECONDS:
+            print(f"Using cached article {ascii_safe(article_title(url))}", flush=True)
+            return cache_file.read_text(encoding="utf-8"), True
+    except (FileNotFoundError, OSError, UnicodeError):
+        pass
     parsed = urlparse(url)
     title = unquote(parsed.path.split("/wiki/", 1)[1])
     api_url = urlunparse((parsed.scheme, parsed.netloc, "/api/rest_v1/page/html/" + quote(title, safe=""), "", "", ""))
@@ -82,7 +129,12 @@ def fetch_article(url: str) -> str:
         request = Request(api_url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
         try:
             with urlopen(request, timeout=30) as response:  # noqa: S310
-                return response.read().decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+                content = response.read().decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            temporary_file = cache_file.with_suffix(".tmp")
+            temporary_file.write_text(content, encoding="utf-8")
+            temporary_file.replace(cache_file)
+            return content, False
         except HTTPError as exc:
             if exc.code not in {429, 503} or attempt >= MAX_RETRIES:
                 raise
@@ -94,6 +146,7 @@ def fetch_article(url: str) -> str:
             wait_seconds = min(wait_seconds, 300.0)
             print(f"  HTTP {exc.code}; retrying in {wait_seconds:g}s", flush=True)
             time.sleep(wait_seconds)
+    raise RuntimeError(f"Could not fetch {url}")
 
 
 class ArticleParser(HTMLParser):
@@ -104,15 +157,16 @@ class ArticleParser(HTMLParser):
         self.links: set[str] = set()
         self.active = False
         self.skip_depth = 0
+        self.open_tags: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attributes = dict(attrs)
         tag = tag.lower()
-        if tag in {"script", "style", "noscript"}:
+        attributes = dict(attrs)
+        if tag in {"script", "style", "noscript", "br", "table", "thead", "tbody", "tfoot", "tr", "td", "th"}:
             self.skip_depth = 1
             return
         if self.skip_depth:
-            if tag not in {"img", "br", "hr", "meta", "link", "input"}:
+            if tag not in VOID_TAGS:
                 self.skip_depth += 1
             return
         classes = attributes.get("class", "") or ""
@@ -120,28 +174,44 @@ class ArticleParser(HTMLParser):
             self.active = True
         if not self.active or tag in {"html", "body", "main"}:
             return
+        if tag not in SUPPORTED_TAGS:
+            return
         safe = ""
-        if tag == "a" and attributes.get("href"):
-            target = canonical_url(attributes["href"], self.source_url)
+        if tag == "a":
+            target = canonical_url(attributes.get("href", ""), self.source_url) if attributes.get("href") else ""
             if target:
                 self.links.add(target)
-                safe = f' data-wikipedia-url="{html.escape(target, quote=True)}"'
+                safe = f' href="{html.escape(target, quote=True)}" data-wikipedia-url="{html.escape(target, quote=True)}"'
             else:
-                safe = f' data-external-url="{html.escape(urljoin(self.source_url, attributes["href"]), quote=True)}"'
+                safe = ' href=""'
         elif tag == "img" and attributes.get("src"):
             safe = f' src="{html.escape(urljoin(self.source_url, attributes["src"]), quote=True)}"'
         self.parts.append(f"<{tag}{safe}>")
+        if tag not in VOID_TAGS:
+            self.open_tags.append(tag)
 
     def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
         if self.skip_depth:
             self.skip_depth -= 1
             return
-        if self.active and tag.lower() not in {"html", "body", "main"}:
-            self.parts.append(f"</{tag}>")
+        if not self.active or tag not in SUPPORTED_TAGS or tag in VOID_TAGS:
+            return
+        if tag in self.open_tags:
+            while self.open_tags:
+                current = self.open_tags.pop()
+                self.parts.append(f"</{current}>")
+                if current == tag:
+                    break
 
     def handle_data(self, data: str) -> None:
         if self.active and not self.skip_depth:
             self.parts.append(html.escape(data))
+
+    def close(self) -> None:
+        super().close()
+        while self.open_tags:
+            self.parts.append(f"</{self.open_tags.pop()}>")
 
 
 def parse_article(source_url: str, article_html: str) -> tuple[str, set[str]]:
@@ -154,24 +224,77 @@ def parse_article(source_url: str, article_html: str) -> tuple[str, set[str]]:
     return content, parser.links
 
 
-def rewrite_links(content: str, pdf_by_url: dict[str, Path]) -> str:
+def rewrite_media(content: str, media_directory: Path) -> str:
+    def cached_image(match: re.Match[str]) -> str:
+        url = html.unescape(match.group(1))
+        try:
+            media_path = fetch_media(url, media_directory)
+            from PIL import Image
+            with Image.open(media_path) as image:
+                image.verify()
+            return f' src="{html.escape(str(media_path), quote=True)}"'
+        except Exception as exc:
+            print(f"  WARNING: image unavailable: {ascii_safe(url)} ({ascii_safe(repr(exc))})", file=sys.stderr, flush=True)
+            return ""
+    return re.sub(r' src="([^"]+)"', cached_image, content)
+
+
+def rewrite_links(content: str, pdf_by_url: dict[str, Path], output_directory: Path, source_pdf: Path | None = None) -> str:
     def local_link(match: re.Match[str]) -> str:
         pdf = pdf_by_url.get(match.group(1))
-        return f' href="{html.escape(os.path.relpath(pdf.resolve(), start=Path.cwd().resolve()).replace(os.sep, "/"), quote=True)}"' if pdf else ""
+        if not pdf:
+            return ' href=""'
+        base = source_pdf.parent if source_pdf is not None else output_directory
+        relative_path = os.path.relpath(pdf, start=base).replace(os.sep, "/")
+        return f' href="{html.escape(relative_path, quote=True)}"'
+    rewritten = re.sub(r' href="[^"]*" data-wikipedia-url="([^"]+)"', local_link, content)
+    return re.sub(r' data-wikipedia-url="[^"]+"', "", rewritten)
 
-    # Keep external links as text for offline use.
-    content = re.sub(r' data-wikipedia-url="([^"]+)"', local_link, content)
-    content = re.sub(r' data-external-url="[^"]+"', "", content)
-    return content
+
+@lru_cache(maxsize=1)
+def find_unicode_font() -> Path:
+    candidates = [
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arial.ttf",
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeui.ttf",
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/dejavu/DejaVuSans.ttf"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise RuntimeError("No Unicode TrueType font found. Install a system font such as Arial or DejaVu Sans.")
 
 
 def render_pdf(title: str, content: str, output: Path) -> None:
     try:
-        from weasyprint import HTML
-    except (ImportError, OSError) as exc:
-        raise RuntimeError("WeasyPrint/GTK3 is unavailable. Install requirements.txt and the Windows GTK3 runtime.") from exc
-    document = f'''<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title><style>@page {{ size:A4; margin:2.1cm 2cm 2.3cm; @bottom-center {{ content:"Page " counter(page); font:9pt Arial; color:#777; }} }} body {{ font-family:Georgia,"Times New Roman",serif; color:#202124; line-height:1.58; font-size:10.8pt; }} .article-title {{ font:bold 27pt Arial,sans-serif; color:#18212b; border-bottom:3px solid #3b6ea5; padding-bottom:.32em; margin:0 0 1em; }} h2 {{ font:bold 17pt Arial,sans-serif; color:#234f7d; border-bottom:1px solid #c8d3df; margin:1.45em 0 .55em; }} h3 {{ font:bold 13pt Arial,sans-serif; color:#315f87; }} a {{ color:#245b91; text-decoration:none; }} a[href^="file:"] {{ -weasy-link: underline; }} img {{ max-width:100%; height:auto; }} table {{ border-collapse:collapse; width:100%; margin:1em 0; font-size:9pt; page-break-inside:avoid; }} th {{ background:#e9f0f7; text-align:left; }} th,td {{ border:1px solid #bbc7d2; padding:5px 7px; vertical-align:top; }} blockquote {{ border-left:4px solid #9bb5cd; padding:.2em 1em; color:#4d5660; }}</style></head><body><h1 class="article-title">{html.escape(title)}</h1><article>{content}</article></body></html>'''
-    HTML(string=document, base_url=str(output.parent.resolve())).write_pdf(str(output))
+        from fpdf import FPDF
+    except ImportError as exc:
+        raise RuntimeError("fpdf2 is unavailable. Install requirements.txt.") from exc
+
+    class ArticlePDF(FPDF):
+        def footer(self) -> None:
+            self.set_y(-15)
+            self.set_font("ArticleFont", size=9)
+            self.set_text_color(119, 119, 119)
+            self.cell(0, 10, f"Page {self.page_no()}", align="C")
+
+    pdf = ArticlePDF()
+    font_path = find_unicode_font()
+    for style in ("", "B", "I", "BI"):
+        pdf.add_font("ArticleFont", style=style, fname=str(font_path))
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    pdf.set_title(title)
+    pdf.set_font("ArticleFont", "B", 22)
+    pdf.set_text_color(24, 33, 43)
+    pdf.multi_cell(0, 12, title)
+    pdf.set_draw_color(59, 110, 165)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+    pdf.ln(6)
+    pdf.set_font("ArticleFont", size=10)
+    pdf.set_text_color(32, 33, 36)
+    pdf.write_html(content)
+    pdf.output(output)
 
 
 def create_shortcut(target: Path, shortcut: Path) -> None:
@@ -189,7 +312,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("master_file", type=Path)
     parser.add_argument("--output", type=Path, default=Path("Noter"))
+    parser.add_argument("--workers", type=int, default=None, help="Number of PDFs to render concurrently (default: up to 4)")
+    parser.add_argument("--request-delay", type=float, default=DEFAULT_REQUEST_DELAY, help="Seconds to wait between article downloads (default: 1)")
     args = parser.parse_args()
+    if args.workers is not None and args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.request_delay < 0:
+        parser.error("--request-delay cannot be negative")
+    clean_response_cache(CACHE_DIR)
     subjects = read_master_file(args.master_file)
     direct_by_subject = {subject: {canonical_url(url) for url in urls if canonical_url(url)} for subject, urls in subjects.items()}
     root_urls = set().union(*direct_by_subject.values()) if direct_by_subject else set()
@@ -199,8 +329,10 @@ def main() -> int:
     while pending:
         url = pending.pop(0)
         print(f"Downloading {ascii_safe(article_title(url))}", flush=True)
+        cache_hit = False
         try:
-            content, links = parse_article(url, fetch_article(url))
+            article_html, cache_hit = fetch_article(url)
+            content, links = parse_article(url, article_html)
             pages[url] = (content, links)
             if url in root_urls:
                 for link in links:
@@ -209,17 +341,23 @@ def main() -> int:
                         pending.append(link)
         except Exception as exc:
             print(f"  ERROR: {ascii_safe(repr(exc))}", file=sys.stderr, flush=True)
-        time.sleep(1)
+        if not cache_hit and args.request_delay:
+            time.sleep(args.request_delay)
     articles_dir = args.output / "artikler"
     articles_dir.mkdir(parents=True, exist_ok=True)
     pdf_by_url = {url: articles_dir / safe_filename(article_title(url)) for url in pages}
     jobs = list(pages.items())
-    workers = min(4, max(1, len(jobs)))
+    workers = args.workers if args.workers is not None else min(4, max(1, len(jobs)))
+    workers = min(workers, max(1, len(jobs)))
     print(f"Rendering {len(jobs)} PDFs with {workers} workers...", flush=True)
+
     def render_one(item):
         url, (content, _) = item
-        render_pdf(article_title(url), rewrite_links(content, pdf_by_url), pdf_by_url[url])
+        output = pdf_by_url[url]
+        rendered_content = rewrite_media(rewrite_links(content, pdf_by_url, articles_dir, output), MEDIA_CACHE_DIR)
+        render_pdf(article_title(url), rendered_content, output)
         return url
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(render_one, item): item[0] for item in jobs}
         for index, future in enumerate(as_completed(futures), 1):

@@ -2,6 +2,10 @@
 Noter/
 artikler.txt
 
+# Wikipedia API and media response caches
+.wikipedia-cache/
+.wikipedia-media-cache/
+
 # Python
 __pycache__/
 *.py[cod]

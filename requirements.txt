@@ -1,1 +1,1 @@
-WeasyPrint>=62,<70
+fpdf2==2.8.8
