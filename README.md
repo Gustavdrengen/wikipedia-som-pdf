@@ -1,22 +1,44 @@
 # Wikipedia-artikler som PDF
 
-Dette program henter Wikipedia-artikler via Wikipedias REST API og gemmer dem som læsevenlige PDF-filer til offline brug. API-svar caches lokalt i `.wikipedia-cache/`; cachefiler ældre end én måned slettes ved opstart.
+Programmet henter Wikipedia-artikler via Wikipedias REST API og gemmer dem som læsevenlige PDF-filer til offline brug. API-svar caches lokalt i `.wikipedia-cache/`, og cachefiler ældre end én måned slettes ved opstart. Billeder caches lokalt i `.wikipedia-media-cache/`.
 
 ## Installation
 
-Programmet kræver Python 3.10 eller nyere. Installer Python-afhængighederne fra projektmappen:
+Programmet kræver Python 3.10 eller nyere. Installer afhængighederne:
 
 ```cmd
 python -m pip install -r requirements.txt
 ```
 
-PDF-genereringen bruger `fpdf2` og kræver ingen separat runtime.
+PDF-genereringen bruger den fastlåste `fpdf2`-version i `requirements.txt`.
 
-## Opret inputfilen
+## Kør fra kommandolinjen
 
-Inputfilen skal ligge uden for projektet. Standardnavnet kan være `artikler.txt`; filen er med vilje ignoreret af Git.
+```cmd
+python cli.py artikler.txt
+```
 
-Formatet er en overskrift med kolon efterfulgt af Wikipedia-links:
+Valgfrie indstillinger:
+
+```cmd
+python cli.py artikler.txt --output MitNoter --workers 2 --request-delay 1
+```
+
+Programmet venter ét sekund mellem artikel-downloads som standard, og billed-downloads bruger samme globale Wikimedia-begrænsning. Der køres højst to samtidige PDF-renderinger/download-relaterede jobs som standard for at holde belastningen lav. Cache hits udløser ingen netværksventetid. Wikimedia-svar med 429/503 respekterer `Retry-After` og bruger exponential backoff, hvis headeren mangler. Links fra de oprindelige artikler følges ét niveau, og lokale PDF-links skrives som relative stier.
+
+## Grafisk brugerflade
+
+Start tkinter-brugerfladen med:
+
+```cmd
+python gui.py
+```
+
+GUI'en lader dig vælge inputfil, outputmappe, antal PDF-workers og request delay. Genereringen kører i en baggrundstråd, så vinduet forbliver responsivt.
+
+## Inputfil
+
+Inputfilen består af en overskrift med kolon efterfulgt af Wikipedia-links:
 
 ```text
 Matematik:
@@ -27,73 +49,35 @@ Fysik:
 https://da.wikipedia.org/wiki/Fysik
 ```
 
-Regler:
-
-- Hvert emne skal afsluttes med et kolon, for eksempel `Matematik:`.
-- Hvert link skal stå på sin egen linje.
-- Tomme linjer og linjer, der begynder med `#`, ignoreres.
-- Wikipedia-links må gerne indeholde danske tegn som `æ`, `ø` og `å`.
-- Kun almindelige Wikipedia-artikler følges. Kategorier, filer, skabeloner, diskussionssider og special-sider ignoreres.
-
-## Kør programmet
-
-Kør programmet fra projektmappen og angiv inputfilen:
-
-```cmd
-python generate.py sti\til\artikler.txt
-```
-
-Eksempel:
-
-```cmd
-python generate.py C:\Users\DitNavn\Dokumenter\artikler.txt
-```
-
-Programmet downloader først artiklerne fra inputfilen og derefter Wikipedia-artikler, der er linket direkte fra disse artikler. Der følges kun ét niveau af links; links fra de nyfundne artikler downloades ikke.
+Tomme linjer og kommentarer, der begynder med `#`, ignoreres. Kun almindelige Wikipedia-artikler følges; kategorier, filer, skabeloner, diskussionssider og special-sider ignoreres.
 
 ## Resultat
-
-Resultatet placeres som standard i mappen `Noter`:
 
 ```text
 Noter/
 ├── Matematik/
 │   ├── Matematik.lnk
 │   └── Lineær funktion.lnk
-├── Fysik/
-│   └── Fysik.lnk
 └── artikler/
     ├── Matematik.pdf
-    ├── Lineær funktion.pdf
-    └── Fysik.pdf
+    └── Lineær funktion.pdf
 ```
 
-- De faktiske PDF-filer ligger i `Noter/artikler/`.
-- På Windows oprettes `.lnk`-genveje i emnemapperne.
-- På macOS og Linux oprettes symbolske links.
-- Der oprettes kun genveje til links, der står direkte i inputfilen.
-- Links inde i PDF-filer peger på lokale PDF-filer med relative stier, hvis artiklen er downloadet.
-- Links til artikler, der ikke er downloadet, samt links til andre hjemmesider, vises som almindelig tekst, så materialet fungerer offline.
+De faktiske PDF-filer ligger i `Noter/artikler/`. På Windows oprettes `.lnk`-genveje; på macOS og Linux oprettes symbolske links. Links til downloadede artikler i PDF'erne er relative og afhænger derfor ikke af den oprindelige computerplacering. Links til ikke-downloadede artikler og eksterne websteder vises som almindelig tekst.
 
-## Valgfri indstillinger
+## Kildekode
 
-Vælg en anden outputmappe:
-
-```cmd
-python generate.py artikler.txt --output MitNoter
+```text
+cli.py                 # Kommandolinje-entrypoint
+ gui.py                # tkinter-entrypoint
+src/
+├── app.py             # Fælles genereringsworkflow
+├── config.py          # Konstanter og cacheindstillinger
+├── html_processing.py # HTML, links og billeder
+├── input.py           # Inputfil-parser
+├── pdf_renderer.py    # fpdf2-rendering
+├── shortcuts.py       # Windows-genveje og Unix-links
+├── utils.py           # Fælles hjælpefunktioner
+├── wikipedia.py       # URL'er, API og artikel-cache
+└── rate_limit.py      # Fælles Wikimedia request-begrænsning
 ```
-
-Styr renderingshastigheden med antal samtidige PDF-renderinger:
-
-```cmd
-python generate.py artikler.txt --workers 2
-```
-
-Programmet venter ét sekund mellem downloads som standard for at begrænse request-hastigheden. Forsinkelsen kan ændres efter behov:
-
-```cmd
-python generate.py artikler.txt --request-delay 1
-```
-
-Sammenlign hastigheden ved at køre samme input med for eksempel `--workers 1`, `--workers 2` og `--workers 4`. Sammenlign den samlede køretid og hold øje med fejl eller højt RAM-forbrug; vælg den hurtigste stabile indstilling.
-
