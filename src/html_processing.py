@@ -1,17 +1,20 @@
 import hashlib
 import html
+import json
 import re
 import sys
+import threading
 import time
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from .config import CACHE_MAX_AGE_SECONDS, DEFAULT_MEDIA_REQUEST_DELAY, MEDIA_CACHE_DIR, SUPPORTED_TAGS, USER_AGENT, VOID_TAGS
 from .rate_limit import RequestLimiter
 from .utils import ascii_safe
-from .wikipedia import canonical_url
+from .wikipedia import canonical_url, load_processed_article, store_processed_article
 
 
 class ArticleParser(HTMLParser):
@@ -27,7 +30,7 @@ class ArticleParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         attributes = dict(attrs)
-        if tag in {"script", "style", "noscript", "br", "table", "thead", "tbody", "tfoot", "tr", "td", "th"}:
+        if tag in {"script", "style", "noscript", "table", "thead", "tbody", "tfoot", "tr", "td", "th"}:
             self.skip_depth = 1
             return
         if self.skip_depth:
@@ -78,37 +81,87 @@ class ArticleParser(HTMLParser):
             self.parts.append(f"</{self.open_tags.pop()}>")
 
 
-def parse_article(source_url: str, article_html: str) -> tuple[str, set[str]]:
+def parse_article(source_url: str, article_html: str, cache_dir: Path | None = None) -> tuple[str, set[str]]:
+    if cache_dir is not None:
+        cached = load_processed_article(source_url, cache_dir)
+        if cached is not None:
+            return cached
     parser = ArticleParser(source_url)
     parser.feed(article_html)
     parser.close()
     content = "".join(parser.parts)
     if not content.strip():
         raise ValueError("Wikipedia article content could not be found")
+    if cache_dir is not None:
+        store_processed_article(source_url, content, parser.links, cache_dir)
     return content, parser.links
 
 _MEDIA_REQUEST_LIMITER = RequestLimiter(DEFAULT_MEDIA_REQUEST_DELAY)
+_MEDIA_LOCK = threading.Lock()
+_MEDIA_IN_FLIGHT: dict[str, threading.Event] = {}
+_MEDIA_FAILURES = {400, 401, 403, 404, 410, 451}
 
 
 def fetch_media(url: str, cache_dir: Path = MEDIA_CACHE_DIR) -> Path:
     suffix = Path(urlparse(url).path).suffix.lower()
     if suffix not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}:
         suffix = ".bin"
-    cache_file = cache_dir / f"{hashlib.sha256(url.encode('utf-8')).hexdigest()}{suffix}"
-    if cache_file.exists() and time.time() - cache_file.stat().st_mtime <= CACHE_MAX_AGE_SECONDS:
-        return cache_file
-    _MEDIA_REQUEST_LIMITER.wait()
-    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"})
-    with urlopen(request, timeout=30) as response:  # noqa: S310
-        data = response.read()
-        content_type = response.headers.get_content_type()
-    if content_type not in {"image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"}:
-        raise ValueError(f"unexpected image content type: {content_type}")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    temporary_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
-    temporary_file.write_bytes(data)
-    temporary_file.replace(cache_file)
-    return cache_file
+    key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    cache_file = cache_dir / f"{key}{suffix}"
+    failure_file = cache_dir / f"{key}.failure"
+    try:
+        if time.time() - cache_file.stat().st_mtime <= CACHE_MAX_AGE_SECONDS:
+            return cache_file
+    except (FileNotFoundError, OSError):
+        pass
+    try:
+        if time.time() - failure_file.stat().st_mtime <= CACHE_MAX_AGE_SECONDS:
+            raise HTTPError(url, int(failure_file.read_text(encoding="utf-8") or "404"), "Cached media failure", {}, None)
+    except (FileNotFoundError, OSError, ValueError):
+        try:
+            failure_file.unlink()
+        except FileNotFoundError:
+            pass
+    with _MEDIA_LOCK:
+        event = _MEDIA_IN_FLIGHT.get(url)
+        if event is None:
+            event = threading.Event()
+            _MEDIA_IN_FLIGHT[url] = event
+            owner = True
+        else:
+            owner = False
+    if not owner:
+        event.wait()
+        return fetch_media(url, cache_dir)
+    try:
+        for attempt in range(4):
+            _MEDIA_REQUEST_LIMITER.wait()
+            try:
+                request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"})
+                with urlopen(request, timeout=30) as response:  # noqa: S310
+                    data = response.read()
+                    content_type = response.headers.get_content_type()
+                if content_type not in {"image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"}:
+                    raise ValueError(f"unexpected image content type: {content_type}")
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                temporary_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
+                temporary_file.write_bytes(data)
+                temporary_file.replace(cache_file)
+                return cache_file
+            except HTTPError as exc:
+                if exc.code in _MEDIA_FAILURES:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    temporary_failure = failure_file.with_suffix(".tmp")
+                    temporary_failure.write_text(str(exc.code), encoding="utf-8")
+                    temporary_failure.replace(failure_file)
+                    raise
+                if exc.code not in {429, 500, 502, 503, 504} or attempt == 3:
+                    raise
+                time.sleep(min(60.0, 2.0 ** attempt))
+    finally:
+        with _MEDIA_LOCK:
+            _MEDIA_IN_FLIGHT.pop(url, None)
+            event.set()
 
 
 def rewrite_media(content: str, media_directory: Path = MEDIA_CACHE_DIR) -> str:

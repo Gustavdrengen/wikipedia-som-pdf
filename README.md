@@ -1,6 +1,6 @@
 # Wikipedia-artikler som PDF
 
-Programmet henter Wikipedia-artikler via Wikipedias REST API og gemmer dem som læsevenlige PDF-filer til offline brug. API-svar caches lokalt i `.wikipedia-cache/`, og cachefiler ældre end én måned slettes ved opstart. Billeder caches lokalt i `.wikipedia-media-cache/`.
+Programmet henter Wikipedia-artikler via Wikipedias REST API og gemmer dem som læsevenlige PDF-filer til offline brug. Behandlede artikler og permanente fejl caches lokalt i `.wikipedia-cache/`, og cachefiler ældre end én måned slettes ved opstart. Billeder caches lokalt i `.wikipedia-media-cache/`.
 
 ## Installation
 
@@ -24,7 +24,7 @@ Valgfrie indstillinger:
 python cli.py artikler.txt --output MitNoter --workers 2 --request-delay 1
 ```
 
-Programmet venter ét sekund mellem artikel-downloads som standard, og billed-downloads bruger samme globale Wikimedia-begrænsning. Der køres højst to samtidige PDF-renderinger/download-relaterede jobs som standard for at holde belastningen lav. Cache hits udløser ingen netværksventetid. Wikimedia-svar med 429/503 respekterer `Retry-After` og bruger exponential backoff, hvis headeren mangler. Links fra de oprindelige artikler følges ét niveau, og lokale PDF-links skrives som relative stier.
+Artikel-downloads bruger en global Wikimedia-begrænsning, og billed-downloads bruger samme begrænsning. Der køres højst to samtidige PDF-renderinger/download-relaterede jobs som standard for at holde belastningen lav. Cache hits udløser ingen netværksventetid, heller ikke for tidligere permanente fejl. Wikimedia-svar med 429/503 respekterer `Retry-After` og bruger exponential backoff, hvis headeren mangler. Links fra de oprindelige artikler følges ét niveau, og lokale PDF-links skrives som relative stier.
 
 ## Grafisk brugerflade
 
