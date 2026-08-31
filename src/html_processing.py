@@ -11,16 +11,18 @@ from urllib.error import HTTPError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
+from .articles import load_processed_article, store_processed_article
 from .config import CACHE_MAX_AGE_SECONDS, DEFAULT_MEDIA_REQUEST_DELAY, MEDIA_CACHE_DIR, SUPPORTED_TAGS, USER_AGENT, VOID_TAGS
 from .rate_limit import RequestLimiter
+from .sites import canonical_url, site_for
 from .utils import ascii_safe
-from .wikipedia import canonical_url, load_processed_article, store_processed_article
 
 
 class ArticleParser(HTMLParser):
     def __init__(self, source_url: str) -> None:
         super().__init__(convert_charrefs=True)
         self.source_url = source_url
+        self.site = site_for(source_url)
         self.parts: list[str] = []
         self.links: set[str] = set()
         self.active = False
@@ -37,8 +39,7 @@ class ArticleParser(HTMLParser):
             if tag not in VOID_TAGS:
                 self.skip_depth += 1
             return
-        classes = attributes.get("class", "") or ""
-        if attributes.get("id") == "mw-content-text" or "mw-parser-output" in classes:
+        if self.site is not None and self.site.is_content_start(attributes):
             self.active = True
         if not self.active or tag in {"html", "body", "main"} or tag not in SUPPORTED_TAGS:
             return
@@ -48,7 +49,7 @@ class ArticleParser(HTMLParser):
             if target:
                 self.links.add(target)
                 escaped = html.escape(target, quote=True)
-                safe = f' href="{escaped}" data-wikipedia-url="{escaped}"'
+                safe = f' href="{escaped}" data-article-url="{escaped}"'
             else:
                 safe = ' href=""'
         elif tag == "img" and attributes.get("src"):
@@ -91,7 +92,7 @@ def parse_article(source_url: str, article_html: str, cache_dir: Path | None = N
     parser.close()
     content = "".join(parser.parts)
     if not content.strip():
-        raise ValueError("Wikipedia article content could not be found")
+        raise ValueError("Article content could not be found")
     if cache_dir is not None:
         store_processed_article(source_url, content, parser.links, cache_dir)
     return content, parser.links
@@ -100,20 +101,26 @@ _MEDIA_REQUEST_LIMITER = RequestLimiter(DEFAULT_MEDIA_REQUEST_DELAY)
 _MEDIA_LOCK = threading.Lock()
 _MEDIA_IN_FLIGHT: dict[str, threading.Event] = {}
 _MEDIA_FAILURES = {400, 401, 403, 404, 410, 451}
+_MEDIA_SUFFIXES = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/svg+xml": ".svg",
+}
 
 
 def fetch_media(url: str, cache_dir: Path = MEDIA_CACHE_DIR) -> Path:
-    suffix = Path(urlparse(url).path).suffix.lower()
-    if suffix not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}:
-        suffix = ".bin"
     key = hashlib.sha256(url.encode("utf-8")).hexdigest()
-    cache_file = cache_dir / f"{key}{suffix}"
     failure_file = cache_dir / f"{key}.failure"
-    try:
-        if time.time() - cache_file.stat().st_mtime <= CACHE_MAX_AGE_SECONDS:
-            return cache_file
-    except (FileNotFoundError, OSError):
-        pass
+    for suffix in _MEDIA_SUFFIXES.values():
+        cache_file = cache_dir / f"{key}{suffix}"
+        try:
+            if time.time() - cache_file.stat().st_mtime <= CACHE_MAX_AGE_SECONDS:
+                return cache_file
+        except (FileNotFoundError, OSError):
+            continue
+
     try:
         if time.time() - failure_file.stat().st_mtime <= CACHE_MAX_AGE_SECONDS:
             raise HTTPError(url, int(failure_file.read_text(encoding="utf-8") or "404"), "Cached media failure", {}, None)
@@ -141,9 +148,11 @@ def fetch_media(url: str, cache_dir: Path = MEDIA_CACHE_DIR) -> Path:
                 with urlopen(request, timeout=30) as response:  # noqa: S310
                     data = response.read()
                     content_type = response.headers.get_content_type()
-                if content_type not in {"image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"}:
+                suffix = _MEDIA_SUFFIXES.get(content_type)
+                if suffix is None:
                     raise ValueError(f"unexpected image content type: {content_type}")
                 cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_file = cache_dir / f"{key}{suffix}"
                 temporary_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
                 temporary_file.write_bytes(data)
                 temporary_file.replace(cache_file)
@@ -187,5 +196,5 @@ def rewrite_links(content: str, pdf_by_url: dict[str, Path], source_pdf: Path) -
             return ' href=""'
         relative_path = Path(__import__("os").path.relpath(pdf, start=source_pdf.parent)).as_posix()
         return f' href="{html.escape(relative_path, quote=True)}"'
-    rewritten = re.sub(r' href="[^"]*" data-wikipedia-url="([^"]+)"', local_link, content)
-    return re.sub(r' data-wikipedia-url="[^"]+"', "", rewritten)
+    rewritten = re.sub(r' href="[^"]*" data-article-url="([^"]+)"', local_link, content)
+    return re.sub(r' data-article-url="[^"]+"', "", rewritten)

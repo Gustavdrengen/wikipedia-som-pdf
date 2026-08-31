@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tkinter entrypoint for the Wikipedia PDF generator."""
+"""Tkinter entrypoint for the article PDF generator."""
 
 import queue
 import threading
@@ -13,7 +13,7 @@ from src.config import DEFAULT_REQUEST_DELAY
 
 def main() -> None:
     root = tk.Tk()
-    root.title("Wikipedia-artikler som PDF")
+    root.title("Artikler som PDF")
     root.geometry("720x480")
     messages: queue.Queue[str] = queue.Queue()
 

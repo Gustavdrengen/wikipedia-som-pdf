@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Command-line entrypoint for the Wikipedia PDF generator."""
+"""Command-line entrypoint for the article PDF generator."""
 
 import argparse
 from pathlib import Path
@@ -9,7 +9,7 @@ from src.config import DEFAULT_REQUEST_DELAY
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate an interconnected offline Wikipedia PDF collection.")
+    parser = argparse.ArgumentParser(description="Generate an interconnected offline article PDF collection.")
     parser.add_argument("master_file", type=Path)
     parser.add_argument("--output", type=Path, default=Path("Noter"))
     parser.add_argument("--workers", type=int, default=None, help="Number of article downloads and PDFs rendered concurrently (default: up to 2)")

@@ -1,1 +1,1 @@
-"""Wikipedia article PDF generator package."""
+"""Article PDF generator package."""

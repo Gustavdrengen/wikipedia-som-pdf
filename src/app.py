@@ -4,13 +4,13 @@ from pathlib import Path
 from urllib.error import HTTPError
 import hashlib
 
-from .config import CACHE_DIR, MAX_WIKIMEDIA_CONCURRENCY, MEDIA_CACHE_DIR
+from .articles import article_title, canonical_url, clean_response_cache, fetch_article, safe_filename
+from .config import CACHE_DIR, MAX_CONCURRENCY, MEDIA_CACHE_DIR
 from .html_processing import parse_article, rewrite_links, rewrite_media
 from .input import read_master_file
 from .pdf_renderer import render_pdf
 from .shortcuts import create_shortcut
 from .utils import ascii_safe
-from .wikipedia import article_title, canonical_url, clean_response_cache, fetch_article, safe_filename
 
 
 def generate(master_file: Path, output: Path = Path("Noter"), workers: int | None = None, request_delay: float = 0, log=print) -> int:
@@ -38,7 +38,7 @@ def generate(master_file: Path, output: Path = Path("Noter"), workers: int | Non
         except Exception as exc:
             return url, None, set(), False, exc, time.monotonic() - started
 
-    fetch_workers = min(MAX_WIKIMEDIA_CONCURRENCY, max(1, workers or MAX_WIKIMEDIA_CONCURRENCY))
+    fetch_workers = min(MAX_CONCURRENCY, max(1, workers or MAX_CONCURRENCY))
     while pending:
         batch, pending = pending[:fetch_workers], pending[fetch_workers:]
         with ThreadPoolExecutor(max_workers=fetch_workers) as executor:
@@ -75,7 +75,7 @@ def generate(master_file: Path, output: Path = Path("Noter"), workers: int | Non
         used_filenames[filename] = url
     pdf_by_url = {url: articles_dir / filename for url, (_, filename) in page_info.items()}
     jobs = list(pages.items())
-    worker_count = min(workers or MAX_WIKIMEDIA_CONCURRENCY, MAX_WIKIMEDIA_CONCURRENCY, max(1, len(jobs)))
+    worker_count = min(workers or MAX_CONCURRENCY, MAX_CONCURRENCY, max(1, len(jobs)))
     log(f"Rendering {len(jobs)} PDFs with {worker_count} workers...", flush=True)
 
     def render_one(item):

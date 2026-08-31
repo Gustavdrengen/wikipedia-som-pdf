@@ -1,6 +1,6 @@
 # Wikipedia-artikler som PDF
 
-Programmet henter Wikipedia-artikler via Wikipedias REST API og gemmer dem som læsevenlige PDF-filer til offline brug. Behandlede artikler og permanente fejl caches lokalt i `.wikipedia-cache/`, og cachefiler ældre end én måned slettes ved opstart. Billeder caches lokalt i `.wikipedia-media-cache/`.
+Programmet henter artikler fra registrerede Wikipedia- og Wikimedia-wikier via deres REST API'er og gemmer dem som læsevenlige PDF-filer til offline brug. Behandlede artikler og permanente fejl caches lokalt i `.article-cache/`, og cachefiler ældre end én måned slettes ved opstart. Billeder caches lokalt i `.article-media-cache/`.
 
 ## Installation
 
@@ -72,12 +72,18 @@ cli.py                 # Kommandolinje-entrypoint
  gui.py                # tkinter-entrypoint
 src/
 ├── app.py             # Fælles genereringsworkflow
+├── articles.py        # Artikel-hentning og cache (site-agnostisk)
 ├── config.py          # Konstanter og cacheindstillinger
 ├── html_processing.py # HTML, links og billeder
 ├── input.py           # Inputfil-parser
 ├── pdf_renderer.py    # fpdf2-rendering
 ├── shortcuts.py       # Windows-genveje og Unix-links
 ├── utils.py           # Fælles hjælpefunktioner
-├── wikipedia.py       # URL'er, API og artikel-cache
-└── rate_limit.py      # Fælles Wikimedia request-begrænsning
+├── rate_limit.py      # Fælles request-begrænsning
+└── sites/             # Site-adaptere (én fil per side)
+    ├── registry.py    # Site-beskrivelse og registrering
+    ├── wikipedia.py   # Registrerer wikipedia.org
+    └── wikimedia.py   # Registrerer øvrige Wikimedia-wikier
 ```
+
+Hver side-fil i `src/sites/` registrerer sine domæner og hvordan de håndteres. Domæner uden registreret adapter ignoreres. Nye sider tilføjes ved at droppe en ny fil i `src/sites/`.

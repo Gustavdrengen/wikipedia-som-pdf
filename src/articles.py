@@ -1,16 +1,19 @@
+"""Generic article fetching and caching, driven by registered sites."""
+
 import hashlib
 import json
+import re
 import threading
 import time
 from collections import OrderedDict
-from html import unescape
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .config import CACHE_DIR, CACHE_MAX_AGE_SECONDS, MAX_RETRIES, SKIP_NAMESPACES, USER_AGENT
+from .config import CACHE_DIR, CACHE_MAX_AGE_SECONDS, MAX_RETRIES, USER_AGENT
 from .rate_limit import RequestLimiter
+from .sites import canonical_url as resolve_canonical_url, site_for
 from .utils import ascii_safe
 
 _REQUEST_LIMITER = RequestLimiter(1.0)
@@ -22,23 +25,15 @@ _PERMANENT_FAILURES = {400, 401, 403, 404, 410, 451}
 _TRANSIENT_FAILURES = {429, 500, 502, 503, 504}
 
 
-def canonical_url(url: str, base: str = "https://en.wikipedia.org/wiki/") -> str:
-    parsed = urlparse(urljoin(base, url))
-    if parsed.scheme not in {"http", "https"} or not (parsed.hostname or "").lower().endswith("wikipedia.org") or "/wiki/" not in parsed.path:
-        return ""
-    title = unquote(parsed.path.split("/wiki/", 1)[1]).replace("_", " ").strip()
-    namespace = title.split(":", 1)[0].lower() if ":" in title else ""
-    if not title or namespace in SKIP_NAMESPACES:
-        return ""
-    return urlunparse(("https", parsed.hostname.lower(), "/wiki/" + quote(title.replace(" ", "_"), safe="/:"), "", "", ""))
+def canonical_url(url: str) -> str:
+    return resolve_canonical_url(url)
 
 
 def article_title(url: str) -> str:
-    return unquote(urlparse(url).path.split("/wiki/", 1)[-1]).replace("_", " ").strip() or "Wikipedia article"
+    return site.title(url) if (site := site_for(url)) else url
 
 
 def safe_filename(title: str) -> str:
-    import re
     cleaned = re.sub(r"[^\w. -]+", "", title, flags=re.UNICODE)
     return (re.sub(r"\s+", " ", cleaned).strip(" .") or "article")[:180] + ".pdf"
 
@@ -75,10 +70,10 @@ def clean_response_cache(cache_dir: Path = CACHE_DIR, now: float | None = None) 
     with _CACHE_LOCK:
         _CACHE_INDEX.clear()
     for cache_file in cache_dir.iterdir():
-        if cache_file.suffix not in {".json", ".html", ".404"}:
+        if not cache_file.name.endswith((".parsed.json", ".failure.json")):
             continue
         try:
-            if cache_file.suffix in {".html", ".404"} or now - cache_file.stat().st_mtime > CACHE_MAX_AGE_SECONDS:
+            if now - cache_file.stat().st_mtime > CACHE_MAX_AGE_SECONDS:
                 cache_file.unlink()
         except FileNotFoundError:
             continue
@@ -124,6 +119,9 @@ def store_processed_article(url: str, content: str, links: set[str], cache_dir: 
 
 
 def fetch_article(url: str, cache_dir: Path = CACHE_DIR, request_delay: float = 1.0) -> tuple[str, bool]:
+    site = site_for(url)
+    if site is None:
+        raise ValueError(f"Unsupported site: {url}")
     cached = load_processed_article(url, cache_dir)
     if cached is not None:
         print(f"Using cached processed article {ascii_safe(article_title(url))}", flush=True)
@@ -151,9 +149,7 @@ def fetch_article(url: str, cache_dir: Path = CACHE_DIR, request_delay: float = 
                 raise HTTPError(url, status, "Cached permanent failure", {}, None)
             except (OSError, ValueError, KeyError, TypeError):
                 pass
-        parsed = urlparse(url)
-        title = unquote(parsed.path.split("/wiki/", 1)[1])
-        api_url = urlunparse((parsed.scheme, parsed.netloc, "/api/rest_v1/page/html/" + quote(title, safe=""), "", "", ""))
+        api_url = site.api_url(url)
         for attempt in range(MAX_RETRIES + 1):
             if request_delay:
                 _REQUEST_LIMITER.wait(request_delay)
@@ -161,6 +157,9 @@ def fetch_article(url: str, cache_dir: Path = CACHE_DIR, request_delay: float = 
             try:
                 with urlopen(request, timeout=30) as response:  # noqa: S310
                     content = response.read().decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+                if not site.accepts_content(content):
+                    _write_json(failure_path, {"status": 404})
+                    raise HTTPError(url, 404, "Unsupported page type", {}, None)
                 result.update(content=content, cache_hit=False)
                 return content, False
             except HTTPError as exc:
@@ -186,7 +185,3 @@ def fetch_article(url: str, cache_dir: Path = CACHE_DIR, request_delay: float = 
             entry = _IN_FLIGHT.pop(key, None)
             if entry:
                 entry[0].set()
-
-
-def unescape_url(value: str) -> str:
-    return unescape(value)
