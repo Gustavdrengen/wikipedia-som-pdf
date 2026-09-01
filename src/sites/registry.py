@@ -16,6 +16,7 @@ class Site:
     api_url: Callable[[str], str]
     is_content_start: Callable[[dict[str, str | None]], bool]
     accepts_content: Callable[[str], bool]
+    accepts_media: Callable[[str], bool]
 
     def matches(self, url: str) -> bool:
         host = (urlparse(url).hostname or "").lower()

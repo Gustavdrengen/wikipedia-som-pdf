@@ -1,6 +1,6 @@
 # Wikipedia-artikler som PDF
 
-Programmet henter artikler fra registrerede Wikipedia- og Wikimedia-wikier via deres REST API'er og gemmer dem som læsevenlige PDF-filer til offline brug. Behandlede artikler og permanente fejl caches lokalt i `.article-cache/`, og cachefiler ældre end én måned slettes ved opstart. Billeder caches lokalt i `.article-media-cache/`.
+Programmet henter artikler fra registrerede Wikipedia- og Wikimedia-wikier via deres REST API'er og gemmer dem som læsevenlige PDF-filer til offline brug. Behandlede artikler og permanente fejl caches lokalt i `.article-cache/`. Billeder caches lokalt i `.article-media-cache/`.
 
 ## Installation
 

@@ -11,9 +11,8 @@ from urllib.error import HTTPError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
-from .articles import load_processed_article, store_processed_article
-from .config import CACHE_MAX_AGE_SECONDS, DEFAULT_MEDIA_REQUEST_DELAY, MEDIA_CACHE_DIR, SUPPORTED_TAGS, USER_AGENT, VOID_TAGS
-from .rate_limit import RequestLimiter
+from .config import CACHE_MAX_AGE_SECONDS, MAX_RETRY_WAIT_SECONDS, MEDIA_CACHE_DIR, SUPPORTED_TAGS, USER_AGENT, VOID_TAGS
+from .rate_limit import GLOBAL_REQUEST_LIMITER, wait_with_progress
 from .sites import canonical_url, site_for
 from .utils import ascii_safe
 
@@ -53,7 +52,12 @@ class ArticleParser(HTMLParser):
             else:
                 safe = ' href=""'
         elif tag == "img" and attributes.get("src"):
-            safe = f' src="{html.escape(urljoin(self.source_url, attributes["src"]), quote=True)}"'
+            image_url = urljoin(self.source_url, attributes["src"])
+            image_site = site_for(image_url) or self.site
+            if image_site is None or image_site.accepts_media(image_url):
+                safe = f' src="{html.escape(image_url, quote=True)}"'
+            else:
+                return
         self.parts.append(f"<{tag}{safe}>")
         if tag not in VOID_TAGS:
             self.open_tags.append(tag)
@@ -82,22 +86,15 @@ class ArticleParser(HTMLParser):
             self.parts.append(f"</{self.open_tags.pop()}>")
 
 
-def parse_article(source_url: str, article_html: str, cache_dir: Path | None = None) -> tuple[str, set[str]]:
-    if cache_dir is not None:
-        cached = load_processed_article(source_url, cache_dir)
-        if cached is not None:
-            return cached
+def parse_article(source_url: str, article_html: str) -> tuple[str, set[str]]:
     parser = ArticleParser(source_url)
     parser.feed(article_html)
     parser.close()
     content = "".join(parser.parts)
     if not content.strip():
         raise ValueError("Article content could not be found")
-    if cache_dir is not None:
-        store_processed_article(source_url, content, parser.links, cache_dir)
     return content, parser.links
 
-_MEDIA_REQUEST_LIMITER = RequestLimiter(DEFAULT_MEDIA_REQUEST_DELAY)
 _MEDIA_LOCK = threading.Lock()
 _MEDIA_IN_FLIGHT: dict[str, threading.Event] = {}
 _MEDIA_FAILURES = {400, 401, 403, 404, 410, 451}
@@ -108,15 +105,22 @@ _MEDIA_SUFFIXES = {
     "image/webp": ".webp",
     "image/svg+xml": ".svg",
 }
+_MEDIA_CACHE_INDEX: dict[tuple[str, str], Path] = {}
+_MEDIA_SEEN: set[tuple[str, str]] = set()
 
 
-def fetch_media(url: str, cache_dir: Path = MEDIA_CACHE_DIR) -> Path:
+def fetch_media(url: str, cache_dir: Path = MEDIA_CACHE_DIR, referer: str | None = None) -> Path:
     key = hashlib.sha256(url.encode("utf-8")).hexdigest()
-    failure_file = cache_dir / f"{key}.failure"
+    cache_key = (str(cache_dir.resolve()), url)
+    cached_path = _MEDIA_CACHE_INDEX.get(cache_key)
+    if cached_path is not None:
+        return cached_path
+    failure_file = cache_dir / f"{key}.media-failure"
     for suffix in _MEDIA_SUFFIXES.values():
         cache_file = cache_dir / f"{key}{suffix}"
         try:
             if time.time() - cache_file.stat().st_mtime <= CACHE_MAX_AGE_SECONDS:
+                _MEDIA_CACHE_INDEX[cache_key] = cache_file
                 return cache_file
         except (FileNotFoundError, OSError):
             continue
@@ -139,15 +143,23 @@ def fetch_media(url: str, cache_dir: Path = MEDIA_CACHE_DIR) -> Path:
             owner = False
     if not owner:
         event.wait()
-        return fetch_media(url, cache_dir)
+        return fetch_media(url, cache_dir, referer)
     try:
+        retry_waited = 0.0
         for attempt in range(4):
-            _MEDIA_REQUEST_LIMITER.wait()
+            GLOBAL_REQUEST_LIMITER.wait()
             try:
-                request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"})
+                headers = {
+                    "User-Agent": USER_AGENT,
+                    "Accept": "image/png,image/jpeg,image/gif,image/svg+xml,image/*;q=0.8",
+                }
+                if referer:
+                    headers["Referer"] = referer
+                request = Request(url, headers=headers)
                 with urlopen(request, timeout=30) as response:  # noqa: S310
                     data = response.read()
                     content_type = response.headers.get_content_type()
+                GLOBAL_REQUEST_LIMITER.success()
                 suffix = _MEDIA_SUFFIXES.get(content_type)
                 if suffix is None:
                     raise ValueError(f"unexpected image content type: {content_type}")
@@ -156,32 +168,65 @@ def fetch_media(url: str, cache_dir: Path = MEDIA_CACHE_DIR) -> Path:
                 temporary_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
                 temporary_file.write_bytes(data)
                 temporary_file.replace(cache_file)
+                try:
+                    if suffix != ".svg":
+                        from PIL import Image
+                        with Image.open(cache_file) as image:
+                            image.verify()
+                except Exception:
+                    cache_file.unlink(missing_ok=True)
+                    raise
+                _MEDIA_CACHE_INDEX[cache_key] = cache_file
                 return cache_file
             except HTTPError as exc:
-                if exc.code in _MEDIA_FAILURES:
+                if exc.code in _MEDIA_FAILURES or exc.code == 429:
+                    if exc.code == 429:
+                        retry_after = exc.headers.get("Retry-After")
+                        try:
+                            cooldown = float(retry_after) if retry_after else 60.0
+                        except (TypeError, ValueError):
+                            cooldown = 60.0
+                        GLOBAL_REQUEST_LIMITER.rate_limited(cooldown)
                     cache_dir.mkdir(parents=True, exist_ok=True)
                     temporary_failure = failure_file.with_suffix(".tmp")
                     temporary_failure.write_text(str(exc.code), encoding="utf-8")
                     temporary_failure.replace(failure_file)
                     raise
-                if exc.code not in {429, 500, 502, 503, 504} or attempt == 3:
+                if exc.code not in {500, 502, 503, 504} or attempt == 3:
                     raise
-                time.sleep(min(60.0, 2.0 ** attempt))
+                retry_after = exc.headers.get("Retry-After")
+                try:
+                    wait_seconds = max(5.0, float(retry_after)) if retry_after else 2.0 ** attempt
+                except (TypeError, ValueError):
+                    wait_seconds = 2.0 ** attempt
+                wait_seconds = min(wait_seconds, MAX_RETRY_WAIT_SECONDS - retry_waited)
+                if wait_seconds <= 0:
+                    raise
+                retry_waited += wait_seconds
+                GLOBAL_REQUEST_LIMITER.rate_limited(wait_seconds)
+                print(f"  HTTP {exc.code} for {url}; retrying in {wait_seconds:g}s", flush=True)
+                wait_with_progress(wait_seconds, f"HTTP {exc.code} retry for {url}", log=lambda message, **_: print(message, flush=True))
     finally:
         with _MEDIA_LOCK:
             _MEDIA_IN_FLIGHT.pop(url, None)
             event.set()
 
 
-def rewrite_media(content: str, media_directory: Path = MEDIA_CACHE_DIR) -> str:
+def prepare_media(content: str, source_url: str, media_directory: Path = MEDIA_CACHE_DIR) -> str:
+    site = site_for(source_url)
+
     def cached_image(match: re.Match[str]) -> str:
         url = html.unescape(match.group(1))
+        media_site = site_for(url) or site
+        if media_site is not None and not media_site.accepts_media(url):
+            return ""
+        media_key = (str(media_directory.resolve()), url)
+        with _MEDIA_LOCK:
+            if media_key in _MEDIA_SEEN:
+                return ""
+            _MEDIA_SEEN.add(media_key)
         try:
-            media_path = fetch_media(url, media_directory)
-            if media_path.suffix.lower() != ".svg":
-                from PIL import Image
-                with Image.open(media_path) as image:
-                    image.verify()
+            media_path = fetch_media(url, media_directory, source_url)
             return f' src="{html.escape(str(media_path), quote=True)}"'
         except Exception as exc:
             print(f"  WARNING: image unavailable: {ascii_safe(url)} ({ascii_safe(repr(exc))})", file=sys.stderr, flush=True)

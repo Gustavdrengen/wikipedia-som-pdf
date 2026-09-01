@@ -54,6 +54,10 @@ def _accepts_content(content: str) -> bool:
     return match is None or match.group(1) == "0"
 
 
+def _accepts_media(url: str) -> bool:
+    return True
+
+
 register(Site(
     name="wikipedia",
     domains=("wikipedia.org",),
@@ -62,4 +66,5 @@ register(Site(
     api_url=_api_url,
     is_content_start=_is_content_start,
     accepts_content=_accepts_content,
+    accepts_media=_accepts_media,
 ))
