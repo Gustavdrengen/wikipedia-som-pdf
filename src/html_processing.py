@@ -101,9 +101,9 @@ _MEDIA_FAILURES = {400, 401, 403, 404, 410, 451}
 _MEDIA_SUFFIXES = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
+    "image/gif": ".gif",                    "image/webp": ".webp",
     "image/svg+xml": ".svg",
+
 }
 _MEDIA_CACHE_INDEX: dict[tuple[str, str], Path] = {}
 _MEDIA_SEEN: set[tuple[str, str]] = set()
@@ -227,6 +227,8 @@ def prepare_media(content: str, source_url: str, media_directory: Path = MEDIA_C
             _MEDIA_SEEN.add(media_key)
         try:
             media_path = fetch_media(url, media_directory, source_url)
+            if media_path.suffix.lower() == ".svg":
+                return ""
             return f' src="{html.escape(str(media_path), quote=True)}"'
         except Exception as exc:
             print(f"  WARNING: image unavailable: {ascii_safe(url)} ({ascii_safe(repr(exc))})", file=sys.stderr, flush=True)

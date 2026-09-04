@@ -19,7 +19,7 @@ def main() -> None:
 
     input_path = tk.StringVar()
     output_path = tk.StringVar(value="Noter")
-    workers = tk.IntVar(value=1)
+    workers = tk.IntVar(value=2)
     delay = tk.DoubleVar(value=DEFAULT_REQUEST_DELAY)
 
     frame = ttk.Frame(root, padding=12)

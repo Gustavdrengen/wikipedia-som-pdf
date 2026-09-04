@@ -24,7 +24,7 @@ Valgfrie indstillinger:
 python cli.py artikler.txt --output MitNoter --workers 2 --request-delay 1
 ```
 
-Artikel-downloads bruger en global Wikimedia-begrænsning, og billed-downloads bruger samme begrænsning. Der køres højst to samtidige PDF-renderinger/download-relaterede jobs som standard for at holde belastningen lav. Cache hits udløser ingen netværksventetid, heller ikke for tidligere permanente fejl. Wikimedia-svar med 429/503 respekterer `Retry-After` og bruger exponential backoff, hvis headeren mangler. Links fra de oprindelige artikler følges ét niveau, og lokale PDF-links skrives som relative stier.
+Artikel-downloads bruger en global Wikimedia-begrænsning, og billed-downloads bruger samme begrænsning. Der køres som standard højst fire samtidige PDF-renderinger/download-relaterede jobs (begrænset af CPU-antallet) for at holde belastningen lav. Eksisterende PDF-filer genbruges automatisk, når titel og indhold ikke har ændret sig. Cache hits udløser ingen netværksventetid, heller ikke for tidligere permanente fejl. Wikimedia-svar med 429/503 respekterer `Retry-After` og bruger exponential backoff, hvis headeren mangler. Links fra de oprindelige artikler følges ét niveau, og lokale PDF-links skrives som relative stier.
 
 ## Grafisk brugerflade
 

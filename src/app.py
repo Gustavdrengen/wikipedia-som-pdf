@@ -1,6 +1,7 @@
 import hashlib
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from urllib.error import HTTPError
 
@@ -8,9 +9,16 @@ from .articles import article_title, canonical_url, fetch_article, load_processe
 from .config import CACHE_DIR, MAX_CONCURRENCY, MEDIA_CACHE_DIR
 from .html_processing import parse_article, prepare_media, rewrite_links
 from .input import read_master_file
-from .pdf_renderer import render_pdf
+from .pdf_renderer import fingerprint_of, is_current, render_pdf, save_fingerprints
 from .shortcuts import create_shortcut
 from .utils import ascii_safe
+
+
+def _render_job(payload: tuple[str, str, Path, str]) -> None:
+    # Module-level so ProcessPoolExecutor can pickle it; the fingerprint lets
+    # render_pdf skip PDFs whose content is unchanged since last run.
+    title, content, output, _fingerprint = payload
+    render_pdf(title, content, output)
 
 
 def generate(master_file: Path, output: Path = Path("Noter"), workers: int | None = None, request_delay: float = 0, log=print) -> int:
@@ -102,19 +110,37 @@ def generate(master_file: Path, output: Path = Path("Noter"), workers: int | Non
     media_duration = time.monotonic() - media_started
 
     render_started = time.monotonic()
+    render_jobs = [
+        (page_info[url][0], prepared_content[url], pdf_by_url[url], fingerprint_of(page_info[url][0], prepared_content[url]))
+        for url, _ in jobs
+        if not is_current(pdf_by_url[url], page_info[url][0], prepared_content[url])
+    ]
+    skipped = len(jobs) - len(render_jobs)
 
-    def render_one(item: tuple[str, tuple[str, set[str]]]) -> str:
-        url, _ = item
-        render_pdf(page_info[url][0], prepared_content[url], pdf_by_url[url])
-        return url
+    if render_jobs:
+        log(f"Rendering {len(render_jobs)} PDFs with {worker_count} workers...", flush=True)
+    if skipped:
+        log(f"Reusing {skipped} unchanged PDF(s).", flush=True)
 
-    log(f"Rendering {len(jobs)} PDFs with {worker_count} workers...", flush=True)
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {executor.submit(render_one, item): item[0] for item in jobs}
-        for index, future in enumerate(as_completed(futures), 1):
-            url = futures[future]
-            future.result()
-            log(f"Rendered PDF {index}/{len(jobs)}: {ascii_safe(page_info[url][0])}", flush=True)
+    rendered: dict[str, str] = {}
+    # PDF layout is pure-Python CPU work, so the GIL makes threads useless here;
+    # separate processes are needed for real parallel rendering speedups.
+    try:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = {executor.submit(_render_job, job): job for job in render_jobs}
+            for index, future in enumerate(as_completed(futures), 1):
+                job = futures[future]
+                future.result()
+                rendered[str(job[2].resolve())] = job[3]
+                log(f"Rendered PDF {index}/{len(render_jobs)}: {ascii_safe(job[0])}", flush=True)
+    except (OSError, ValueError, BrokenProcessPool):
+        # Platforms without a working spawn/fork: fall back to in-process
+        # rendering; the fingerprint cache makes the retry nearly free.
+        for index, job in enumerate(render_jobs, 1):
+            _render_job(job)
+            rendered[str(job[2].resolve())] = job[3]
+            log(f"Rendered PDF {index}/{len(render_jobs)}: {ascii_safe(job[0])}", flush=True)
+    save_fingerprints(rendered)
 
     for subject, urls in direct_by_subject.items():
         subject_dir = output / subject

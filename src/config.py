@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 
@@ -19,7 +20,9 @@ _GIT_EMAIL = _git_email()
 USER_AGENT = f"ArticlePdfGeneratorBot/1.0 ({_REPOSITORY_URL}; {_GIT_EMAIL})" if _GIT_EMAIL else f"ArticlePdfGeneratorBot/1.0 ({_REPOSITORY_URL})"
 MAX_RETRIES = 3
 MAX_RETRY_WAIT_SECONDS = 30.0
-MAX_CONCURRENCY = 1
+# PDF layout is CPU-heavy; a small process-wide cap avoids oversubscription while
+# allowing independent articles to render concurrently.
+MAX_CONCURRENCY = min(4, max(1, os.cpu_count() or 1))
 DEFAULT_MEDIA_REQUEST_DELAY = 1.0
 CACHE_MAX_AGE_SECONDS = 31 * 24 * 60 * 60
 CACHE_DIR = Path(".article-cache")
