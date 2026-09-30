@@ -55,7 +55,9 @@ def _accepts_content(content: str) -> bool:
 
 
 def _accepts_media(url: str) -> bool:
-    return True
+    # Math is no longer fetched as SVG: the TeX source is captured while parsing
+    # the article and rendered locally instead (see src.math_render).
+    return "math/render/" not in urlparse(url).path.lower()
 
 
 register(Site(

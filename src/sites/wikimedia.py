@@ -60,7 +60,14 @@ def _accepts_content(content: str) -> bool:
 
 
 def _accepts_media(url: str) -> bool:
-    return "searchtool.svg" not in url.lower()
+    lowered = url.lower()
+    if "searchtool.svg" in lowered:
+        return False
+    # Math is no longer fetched as SVG: the TeX source is captured while parsing
+    # the article and rendered locally instead (see src.math_render).
+    if "math/render/" in urlparse(url).path.lower():
+        return False
+    return "upload.wikimedia.org" in urlparse(url).hostname.lower()
 
 
 register(Site(

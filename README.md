@@ -10,7 +10,7 @@ Programmet kræver Python 3.10 eller nyere. Installer afhængighederne:
 python -m pip install -r requirements.txt
 ```
 
-PDF-genereringen bruger den fastlåste `fpdf2`-version i `requirements.txt`.
+PDF-genereringen bruger den fastlåste `fpdf2`-version i `requirements.txt`. Matematiske formler hentes ikke som SVG-billeder fra Wikimedia: i stedet gengives LaTeX-koden lokalt til PNG via `matplotlib` under PDF-genereringen (med læsbar tekst som fallback).
 
 ## Kør fra kommandolinjen
 
@@ -76,6 +76,7 @@ src/
 ├── config.py          # Konstanter og cacheindstillinger
 ├── html_processing.py # HTML, links og billeder
 ├── input.py           # Inputfil-parser
+├── math_render.py     # Lokal LaTeX→PNG-gengivelse af matematik
 ├── pdf_renderer.py    # fpdf2-rendering
 ├── shortcuts.py       # Windows-genveje og Unix-links
 ├── utils.py           # Fælles hjælpefunktioner

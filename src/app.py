@@ -9,6 +9,7 @@ from .articles import article_title, canonical_url, fetch_article, load_processe
 from .config import CACHE_DIR, MAX_CONCURRENCY, MEDIA_CACHE_DIR
 from .html_processing import parse_article, prepare_media, rewrite_links
 from .input import read_master_file
+from .math_render import render_math_in_content
 from .pdf_renderer import fingerprint_of, is_current, render_pdf, save_fingerprints
 from .shortcuts import create_shortcut
 from .utils import ascii_safe
@@ -92,12 +93,22 @@ def generate(master_file: Path, output: Path = Path("Noter"), workers: int | Non
     worker_count = min(workers or MAX_CONCURRENCY, MAX_CONCURRENCY, max(1, len(jobs)))
 
     media_started = time.monotonic()
+    # Math (TeX) is rendered locally with matplotlib, which is not thread-safe, so
+    # this pass runs single-threaded before figure images are fetched in parallel.
+    math_content: dict[str, str] = {}
+    math_formulas = 0
+    for url, (content, _) in jobs:
+        math_formulas += content.count("<img data-math=")
+        math_content[url] = render_math_in_content(content)
+    if math_formulas:
+        log(f"Rendered {math_formulas} math formula(s) locally ({time.monotonic() - media_started:.1f}s)", flush=True)
+
     prepared_content: dict[str, str] = {}
 
     def prepare_one(item: tuple[str, tuple[str, set[str]]]) -> tuple[str, str]:
         url, (content, _) = item
         pdf = pdf_by_url[url]
-        linked_content = rewrite_links(content, pdf_by_url, pdf)
+        linked_content = rewrite_links(math_content[url], pdf_by_url, pdf)
         return url, prepare_media(linked_content, url, MEDIA_CACHE_DIR)
 
     log(f"Preparing media for {len(jobs)} PDFs with {worker_count} workers...", flush=True)

@@ -27,10 +27,94 @@ class ArticleParser(HTMLParser):
         self.active = False
         self.skip_depth = 0
         self.open_tags: list[str] = []
+        # State while consuming a MediaWiki math block (<span class="mwe-math...">
+        # wrapping hidden MathML + an SVG fallback <img>). Math is never rendered
+        # remotely: we capture the TeX source and emit a data-math placeholder that
+        # the media-preparation step replaces with a locally rendered image.
+        self._math_capture: dict | None = None
+
+    @staticmethod
+    def _is_math_start(tag: str, attributes: dict[str, str | None]) -> bool:
+        if tag == "math":
+            return True
+        classes = attributes.get("class", "") or ""
+        if "mwe-math" in classes:
+            return True
+        if tag == "img":
+            src = (attributes.get("src") or "").lower()
+            return "math/render/" in src
+        return False
+
+    def _begin_math_capture(self) -> None:
+        self._math_capture = {
+            "depth": 0,
+            "annotation_open": False,
+            "annotation": [],
+            "tokens": [],
+            "display": False,
+            "alt": "",
+        }
+
+    def _handle_math_tag(self, tag: str, attributes: dict[str, str | None]) -> None:
+        capture = self._math_capture
+        if tag not in VOID_TAGS:
+            capture["depth"] += 1
+        classes = attributes.get("class", "") or ""
+        if tag == "math" and (attributes.get("display") or "").lower() == "block":
+            capture["display"] = True
+        if "mwe-math-mathml-display" in classes or "mwe-math-element-display" in classes:
+            capture["display"] = True
+        if tag == "annotation" and (attributes.get("encoding") or "") == "application/x-tex":
+            capture["annotation_open"] = True
+        if tag == "img":
+            alt = attributes.get("alt")
+            if alt and not capture["alt"]:
+                capture["alt"] = alt
+
+    def _handle_math_end(self, tag: str) -> None:
+        capture = self._math_capture
+        if tag == "annotation":
+            capture["annotation_open"] = False
+        if tag not in VOID_TAGS:
+            capture["depth"] -= 1
+            if capture["depth"] <= 0:
+                self._finish_math_capture()
+
+    def _finish_math_capture(self) -> None:
+        capture = self._math_capture
+        self._math_capture = None
+        if capture is None:
+            return
+        tex = "".join(capture["annotation"]).strip()
+        if not tex and capture["alt"]:
+            tex = capture["alt"].strip()
+        fallback = "".join(capture["tokens"]).strip()
+        if not tex and not fallback:
+            return
+        display = "1" if capture["display"] else "0"
+        self.parts.append(
+            f'<img data-math="{html.escape(tex, quote=True)}" '
+            f'data-math-fallback="{html.escape(fallback, quote=True)}" '
+            f'data-math-display="{display}">'
+        )
+
+    def _collect_math_data(self, data: str) -> None:
+        capture = self._math_capture
+        if capture["annotation_open"]:
+            capture["annotation"].append(data)
+        else:
+            text = data.strip()
+            if text:
+                capture["tokens"].append(text)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         attributes = dict(attrs)
+        if self._math_capture is not None:
+            # Inside a math block every element contributes to the nesting depth,
+            # whether or not it is one of the supported output tags.
+            self._handle_math_tag(tag, attributes)
+            return
         if tag in {"script", "style", "noscript", "table", "thead", "tbody", "tfoot", "tr", "td", "th"}:
             self.skip_depth = 1
             return
@@ -40,6 +124,13 @@ class ArticleParser(HTMLParser):
             return
         if self.site is not None and self.site.is_content_start(attributes):
             self.active = True
+        if self.active and self._is_math_start(tag, attributes):
+            self._begin_math_capture()
+            self._handle_math_tag(tag, attributes)
+            if tag == "img":
+                # A bare math <img> (no wrapping <span>): void, so close immediately.
+                self._finish_math_capture()
+            return
         if not self.active or tag in {"html", "body", "main"} or tag not in SUPPORTED_TAGS:
             return
         safe = ""
@@ -64,6 +155,9 @@ class ArticleParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        if self._math_capture is not None:
+            self._handle_math_end(tag)
+            return
         if self.skip_depth:
             self.skip_depth -= 1
             return
@@ -77,11 +171,17 @@ class ArticleParser(HTMLParser):
                     break
 
     def handle_data(self, data: str) -> None:
-        if self.active and not self.skip_depth:
+        if self._math_capture is not None:
+            self._collect_math_data(data)
+        elif self.active and not self.skip_depth:
             self.parts.append(html.escape(data))
 
     def close(self) -> None:
         super().close()
+        if self._math_capture is not None:
+            # Unbalanced math block: salvage what was captured rather than
+            # swallowing the rest of the document.
+            self._finish_math_capture()
         while self.open_tags:
             self.parts.append(f"</{self.open_tags.pop()}>")
 
@@ -217,6 +317,14 @@ def prepare_media(content: str, source_url: str, media_directory: Path = MEDIA_C
 
     def cached_image(match: re.Match[str]) -> str:
         url = html.unescape(match.group(1))
+        if not urlparse(url).scheme:
+            # Already a local file (e.g. a locally rendered math PNG): keep it as-is.
+            # The media cache index short-circuit makes it safe to process the same
+            # local path repeatedly without re-verifying every occurrence.
+            media_key = (str(media_directory.resolve()), url)
+            with _MEDIA_LOCK:
+                _MEDIA_CACHE_INDEX.setdefault(media_key, Path(url))
+            return f' src="{html.escape(url, quote=True)}"'
         media_site = site_for(url) or site
         if media_site is not None and not media_site.accepts_media(url):
             return ""
