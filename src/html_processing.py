@@ -206,7 +206,6 @@ _MEDIA_SUFFIXES = {
 
 }
 _MEDIA_CACHE_INDEX: dict[tuple[str, str], Path] = {}
-_MEDIA_SEEN: set[tuple[str, str]] = set()
 
 
 def fetch_media(url: str, cache_dir: Path = MEDIA_CACHE_DIR, referer: str | None = None) -> Path:
@@ -328,11 +327,9 @@ def prepare_media(content: str, source_url: str, media_directory: Path = MEDIA_C
         media_site = site_for(url) or site
         if media_site is not None and not media_site.accepts_media(url):
             return ""
-        media_key = (str(media_directory.resolve()), url)
-        with _MEDIA_LOCK:
-            if media_key in _MEDIA_SEEN:
-                return ""
-            _MEDIA_SEEN.add(media_key)
+        # Every article that references this image keeps it: fetch_media already
+        # dedupes concurrent and repeated work through _MEDIA_CACHE_INDEX and
+        # _MEDIA_IN_FLIGHT, so no extra per-run bookkeeping is needed here.
         try:
             media_path = fetch_media(url, media_directory, source_url)
             if media_path.suffix.lower() == ".svg":

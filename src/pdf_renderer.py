@@ -34,26 +34,36 @@ def _render_cache_path() -> Path:
     return CACHE_DIR / "render-fingerprints.json"
 
 
+# The fingerprint file grows to hundreds of KB, so re-reading and re-parsing it
+# for every article dominated warm re-runs. Keep the parsed mapping in memory
+# for the lifetime of the process instead. render_pdf re-checks is_current after
+# app.py has already filtered unchanged PDFs, so this cache sees the same file
+# twice per article; save_fingerprints keeps it in sync.
+_FINGERPRINTS: dict[str, str] | None = None
+
+
+def _load_fingerprints() -> dict[str, str]:
+    global _FINGERPRINTS
+    if _FINGERPRINTS is None:
+        try:
+            fingerprints = json.loads(_render_cache_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            fingerprints = {}
+        _FINGERPRINTS = fingerprints if isinstance(fingerprints, dict) else {}
+    return _FINGERPRINTS
+
+
 def is_current(output: Path, title: str, content: str) -> bool:
     if not output.is_file():
         return False
-    try:
-        fingerprints = json.loads(_render_cache_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return False
-    return fingerprints.get(str(output.resolve())) == fingerprint_of(title, content)
+    return _load_fingerprints().get(str(output.resolve())) == fingerprint_of(title, content)
 
 
 def save_fingerprints(entries: dict[str, str]) -> None:
     """Merge rendered fingerprints into the shared cache file atomically."""
     path = _render_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fingerprints = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(fingerprints, dict):
-            fingerprints = {}
-    except (OSError, ValueError, TypeError):
-        fingerprints = {}
+    fingerprints = _load_fingerprints()
     fingerprints.update(entries)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(fingerprints), encoding="utf-8")
@@ -65,6 +75,64 @@ def _simplify_html(content: str) -> str:
     content = re.sub(r"<(?:font|center)(?:\s[^>]*)?>", "<span>", content, flags=re.IGNORECASE)
     content = re.sub(r"</(?:font|center)>", "</span>", content, flags=re.IGNORECASE)
     return content.strip()
+
+
+_FONT_FAMILY = "ArticleFont"
+_FONT_STYLES = ("", "B", "I", "BI")
+# add_font() re-parses the whole TrueType file for every style of every PDF, and
+# the glyph-name table for a 1 MB Arial dominates that cost (~100 ms per PDF).
+# Parsing once per process and reusing the immutable parts cuts that to ~2 ms.
+#
+# The prototype cannot be reused directly: fpdf2 subsets each font as the
+# document is written, which mutates the parsed table in place and accumulates
+# glyph IDs. Sharing the prototype therefore corrupts later documents. Instead we
+# clone the prototype and reset exactly the per-document state (subset map, glyph
+# IDs, missing-glyph list, size marker) while handing each document a fresh lazy
+# reader, so subsetting works on its own copy. Verified to produce identical page
+# content and embedded font subsets versus add_font().
+_FONT_PROTOTYPES: dict[str, object] | None = None
+
+
+def _font_prototypes() -> dict[str, object]:
+    """Parse the four font styles once per process and return the prototypes."""
+    global _FONT_PROTOTYPES
+    if _FONT_PROTOTYPES is None:
+        from fpdf import FPDF
+        from fpdf.fonts import TTFFont
+
+        font_path = _font_path()
+        scratch = FPDF()
+        prototypes: dict[str, object] = {}
+        for style in _FONT_STYLES:
+            normalized = "".join(sorted(style.upper()))
+            # Mirrors fpdf2's own fontkey convention: lowercase family + style.
+            fontkey = f"{_FONT_FAMILY.lower()}{normalized}"
+            prototypes[fontkey] = TTFFont(scratch, font_path, fontkey, normalized)
+        _FONT_PROTOTYPES = prototypes
+    return _FONT_PROTOTYPES
+
+
+def _add_article_font(pdf) -> None:
+    """Register the article font in all four styles on ``pdf``."""
+    from fpdf.fonts import SubsetMap
+    from fontTools.ttLib import TTFont as FontToolsTTFont
+
+    font_path = _font_path()
+    for index, prototype in enumerate(_font_prototypes().values(), start=1):
+        font = type(prototype).__new__(type(prototype))
+        for attribute in type(prototype).__slots__:
+            if hasattr(prototype, attribute):
+                setattr(font, attribute, getattr(prototype, attribute))
+        # Per-document state that must not be shared with the prototype.
+        font.i = index
+        font.subset = SubsetMap(font)
+        font.glyph_ids = dict(prototype.glyph_ids)
+        font.missing_glyphs = []
+        font.biggest_size_pt = 0.0
+        # A fresh lazy reader per document: cheap (well under a millisecond) and
+        # it guarantees subsetting mutates only this document's tables.
+        font.ttfont = FontToolsTTFont(str(font_path), lazy=True, recalcTimestamp=False)
+        pdf.fonts[font.fontkey] = font
 
 
 def render_pdf(title: str, content: str, output: Path) -> None:
@@ -85,9 +153,7 @@ def render_pdf(title: str, content: str, output: Path) -> None:
 
     started = time.monotonic()
     pdf = ArticlePDF()
-    font_path = _font_path()
-    for style in ("", "B", "I", "BI"):
-        pdf.add_font("ArticleFont", style=style, fname=str(font_path))
+    _add_article_font(pdf)
     font_setup_duration = time.monotonic() - started
 
     pdf.set_auto_page_break(auto=True, margin=18)
