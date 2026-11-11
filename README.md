@@ -1,6 +1,6 @@
 # Wikipedia-artikler som PDF
 
-Programmet henter artikler fra registrerede Wikipedia- og Wikimedia-wikier via deres REST API'er og gemmer dem som læsevenlige PDF-filer til offline brug. Behandlede artikler og permanente fejl caches lokalt i `.article-cache/`. Billeder caches lokalt i `.article-media-cache/`.
+Programmet henter artikler fra registrerede Wikipedia- og Wikimedia-wikier via deres REST API'er og gemmer dem som læsevenlige PDF-filer til offline brug. Behandlede artikler og permanente fejl caches lokalt i `.article-cache/`. Billeder caches lokalt i `.article-media-cache/`. PDF'erne får bogmærker for alle overskrifter, metadata og klikbare links, og simple datatabeller gengives som tabeller i stedet for at forsvinde.
 
 ## Installation
 
@@ -24,7 +24,24 @@ Valgfrie indstillinger:
 python cli.py artikler.txt --output MitNoter --workers 2 --request-delay 1
 ```
 
-Artikel-downloads bruger en global Wikimedia-begrænsning, og billed-downloads bruger samme begrænsning. Der køres som standard højst fire samtidige PDF-renderinger/download-relaterede jobs (begrænset af CPU-antallet) for at holde belastningen lav. Eksisterende PDF-filer genbruges automatisk, når titel og indhold ikke har ændret sig. Cache hits udløser ingen netværksventetid, heller ikke for tidligere permanente fejl. Wikimedia-svar med 429/503 respekterer `Retry-After` og bruger exponential backoff, hvis headeren mangler. Links fra de oprindelige artikler følges ét niveau, og lokale PDF-links skrives som relative stier.
+Vil du også have en reflowable EPUB til telefon eller e-reader, tilføjes `--epub`:
+
+```cmd
+python cli.py artikler.txt --epub Noter/artikler.epub
+```
+
+Artikel-downloads bruger en global Wikimedia-begrænsning, og billed-downloads bruger samme begrænsning. Der køres som standard højst fire samtidige PDF-renderinger/download-relaterede jobs (begrænset af CPU-antallet) for at holde belastningen lav. Eksisterende PDF-filer genbruges automatisk, når titel og indhold ikke har ændret sig. Cache hits udløser ingen netværksventetid, heller ikke for tidligere permanente fejl. Wikimedia-svar med 429/503 respekterer `Retry-After` og bruger exponential backoff, hvis headeren mangler. Links fra de oprindelige artikler følges ét niveau, og lokale PDF-links skrives som relative stier. Eksterne links forbliver klikbare, og billeder skaleres til sidebredden.
+
+### Cache og oprydning
+
+```cmd
+python cli.py --cache-stats
+python cli.py --prune-cache 31
+python cli.py artikler.txt --refresh
+python cli.py artikler.txt --prune-output
+```
+
+`--cache-stats` viser antal filer og størrelse. `--prune-cache DAYS` sletter cachefiler ældre end det angivne antal dage (`0` tømmer cachen), men rører ikke outputmappen. `--refresh` henter alle artikler igen i stedet for at bruge den mellemliggende artikelcache. `--prune-output` fjerner PDF-filer i `Noter/artikler/`, som ikke hører til den aktuelle kørsel; den er valgfri, fordi flere inputfiler kan dele samme outputmappe.
 
 ## Grafisk brugerflade
 
@@ -34,7 +51,7 @@ Start tkinter-brugerfladen med:
 python gui.py
 ```
 
-GUI'en lader dig vælge inputfil, outputmappe, antal PDF-workers og request delay. Genereringen kører i en baggrundstråd, så vinduet forbliver responsivt.
+GUI'en lader dig vælge inputfil, outputmappe, antal PDF-workers, request delay og en valgfri EPUB-fil. Du kan også tvinge en ny download af alle artikler. Genereringen kører i en baggrundstråd, så vinduet forbliver responsivt.
 
 ## Inputfil
 
@@ -58,26 +75,29 @@ Noter/
 ├── Matematik/
 │   ├── Matematik.lnk
 │   └── Lineær funktion.lnk
-└── artikler/
-    ├── Matematik.pdf
-    └── Lineær funktion.pdf
+├── artikler/
+│   ├── Matematik.pdf
+│   └── Lineær funktion.pdf
+└── artikler.epub          # når --epub er angivet
 ```
 
-De faktiske PDF-filer ligger i `Noter/artikler/`. På Windows oprettes `.lnk`-genveje; på macOS og Linux oprettes symbolske links. Links til downloadede artikler i PDF'erne er relative og afhænger derfor ikke af den oprindelige computerplacering. Links til ikke-downloadede artikler og eksterne websteder vises som almindelig tekst.
+De faktiske PDF-filer ligger i `Noter/artikler/`. På Windows oprettes `.lnk`-genveje; på macOS og Linux oprettes symbolske links. Links til downloadede artikler i PDF'erne er relative og afhænger derfor ikke af den oprindelige computerplacering. Links til ikke-downloadede artikler og eksterne websteder åbner den oprindelige webside i PDF-læseren. Hver PDF har desuden bogmærker for sine overskrifter, og EPUB-filen har en indholdsfortegnelse grupperet efter emnerne i inputfilen.
 
 ## Kildekode
 
 ```text
 cli.py                 # Kommandolinje-entrypoint
- gui.py                # tkinter-entrypoint
+gui.py                 # tkinter-entrypoint
 src/
 ├── app.py             # Fælles genereringsworkflow
 ├── articles.py        # Artikel-hentning og cache (site-agnostisk)
+├── cache_maintenance.py # Cache-statistik og oprydning
 ├── config.py          # Konstanter og cacheindstillinger
-├── html_processing.py # HTML, links og billeder
+├── epub.py            # EPUB 3-eksport
+├── html_processing.py # HTML, links, tabeller og billeder
 ├── input.py           # Inputfil-parser
 ├── math_render.py     # Lokal LaTeX→PNG-gengivelse af matematik
-├── pdf_renderer.py    # fpdf2-rendering
+├── pdf_renderer.py    # fpdf2-rendering, bogmærker og metadata
 ├── shortcuts.py       # Windows-genveje og Unix-links
 ├── utils.py           # Fælles hjælpefunktioner
 ├── rate_limit.py      # Fælles request-begrænsning

@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import re
 import time
@@ -9,7 +10,7 @@ from tempfile import NamedTemporaryFile
 from .config import CACHE_DIR
 from .utils import find_unicode_font
 
-_RENDER_CACHE_VERSION = "2"
+_RENDER_CACHE_VERSION = "3"
 
 
 def fingerprint_of(title: str, content: str) -> str:
@@ -53,21 +54,45 @@ def _load_fingerprints() -> dict[str, str]:
     return _FINGERPRINTS
 
 
-def is_current(output: Path, title: str, content: str) -> bool:
+def is_current(output: Path, title: str, content: str, *, fingerprint: str | None = None) -> bool:
     if not output.is_file():
         return False
-    return _load_fingerprints().get(str(output.resolve())) == fingerprint_of(title, content)
+    expected = fingerprint or fingerprint_of(title, content)
+    return _load_fingerprints().get(str(output.resolve())) == expected
+
+
+def _write_fingerprints(fingerprints: dict[str, str]) -> None:
+    path = _render_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(fingerprints), encoding="utf-8")
+    temporary.replace(path)
 
 
 def save_fingerprints(entries: dict[str, str]) -> None:
     """Merge rendered fingerprints into the shared cache file atomically."""
-    path = _render_cache_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     fingerprints = _load_fingerprints()
     fingerprints.update(entries)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(fingerprints), encoding="utf-8")
-    temporary.replace(path)
+    _write_fingerprints(fingerprints)
+
+
+def prune_fingerprints(valid_paths: set[str] | None = None) -> int:
+    """Drop fingerprint entries whose PDF no longer exists.
+
+    ``valid_paths`` can restrict the prune to the PDFs produced by the current
+    run, which is what ``--prune-output`` wants.
+    """
+    fingerprints = _load_fingerprints()
+    stale = [
+        path
+        for path in fingerprints
+        if (path not in valid_paths if valid_paths is not None else not Path(path).is_file())
+    ]
+    for path in stale:
+        del fingerprints[path]
+    if stale:
+        _write_fingerprints(fingerprints)
+    return len(stale)
 
 
 def _simplify_html(content: str) -> str:
@@ -75,6 +100,38 @@ def _simplify_html(content: str) -> str:
     content = re.sub(r"<(?:font|center)(?:\s[^>]*)?>", "<span>", content, flags=re.IGNORECASE)
     content = re.sub(r"</(?:font|center)>", "</span>", content, flags=re.IGNORECASE)
     return content.strip()
+
+
+_HEADING = re.compile(r"<h([1-6])[^>]*>(.*?)</h\1>", flags=re.IGNORECASE | re.DOTALL)
+
+
+def _flatten_headings(content: str) -> str:
+    """Reduce headings to plain text before rendering.
+
+    fpdf2 starts one outline entry every time it receives text while inside a
+    heading. Inline markup would therefore split "First section" into several
+    bookmarks, so headings are flattened to a single text node.
+    """
+
+    def flatten(match: re.Match[str]) -> str:
+        level = match.group(1)
+        text = html.unescape(re.sub(r"<[^>]+>", " ", match.group(2)))
+        return f"<h{level}>{html.escape(re.sub(r'\s+', ' ', text).strip())}</h{level}>"
+
+    return _HEADING.sub(flatten, content)
+
+
+def _write_html(pdf, content: str) -> None:
+    # table_line_separators draws the full grid instead of just a top border;
+    # pre_code_font keeps <code>/<pre> on our Unicode font instead of fpdf2's
+    # latin-1 "Courier" core font, which crashes on characters like "→".
+    pdf.write_html(
+        _simplify_html(_flatten_headings(content)),
+        font_family=_FONT_FAMILY,
+        pre_code_font=_FONT_FAMILY,
+        table_line_separators=True,
+        warn_on_tags_not_matching=False,
+    )
 
 
 _FONT_FAMILY = "ArticleFont"
@@ -135,8 +192,15 @@ def _add_article_font(pdf) -> None:
         pdf.fonts[font.fontkey] = font
 
 
-def render_pdf(title: str, content: str, output: Path) -> None:
-    if is_current(output, title, content):
+def render_pdf(
+    title: str,
+    content: str,
+    output: Path,
+    *,
+    fingerprint: str | None = None,
+    source_url: str | None = None,
+) -> None:
+    if is_current(output, title, content, fingerprint=fingerprint):
         return
 
     try:
@@ -157,8 +221,15 @@ def render_pdf(title: str, content: str, output: Path) -> None:
     font_setup_duration = time.monotonic() - started
 
     pdf.set_auto_page_break(auto=True, margin=18)
-    pdf.add_page()
     pdf.set_title(title)
+    pdf.set_author("Wikipedia contributors")
+    pdf.set_creator("Article PDF Generator")
+    pdf.set_subject(f"Offline article: {title}")
+    keywords = "Wikipedia, offline, PDF"
+    if source_url:
+        keywords += f", {source_url}"
+    pdf.set_keywords(keywords)
+    pdf.add_page()
     pdf.set_font("ArticleFont", "B", 22)
     pdf.set_text_color(24, 33, 43)
     pdf.multi_cell(0, 12, title)
@@ -169,9 +240,7 @@ def render_pdf(title: str, content: str, output: Path) -> None:
     pdf.set_text_color(32, 33, 36)
 
     html_started = time.monotonic()
-    # pre_code_font keeps <code>/<pre> on our Unicode font instead of fpdf2's
-    # latin-1 "Courier" core font, which crashes on characters like "→".
-    pdf.write_html(_simplify_html(content), font_family="ArticleFont", pre_code_font="ArticleFont")
+    _write_html(pdf, content)
     html_duration = time.monotonic() - html_started
 
     output.parent.mkdir(parents=True, exist_ok=True)

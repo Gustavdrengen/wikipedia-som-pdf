@@ -5,24 +5,35 @@ from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from urllib.error import HTTPError
 
-from .articles import article_title, canonical_url, fetch_article, load_processed_article, safe_filename, store_processed_article
+from .articles import CachedFailure, article_title, canonical_url, fetch_article, load_processed_article, safe_filename, store_processed_article
 from .config import CACHE_DIR, MAX_CONCURRENCY, MEDIA_CACHE_DIR
+from .epub import EpubArticle, write_epub
 from .html_processing import parse_article, prepare_media, rewrite_links
 from .input import read_master_file
 from .math_render import render_math_in_content
-from .pdf_renderer import fingerprint_of, is_current, render_pdf, save_fingerprints
+from .pdf_renderer import fingerprint_of, is_current, prune_fingerprints, render_pdf, save_fingerprints
 from .shortcuts import create_shortcut
 from .utils import ascii_safe
 
 
-def _render_job(payload: tuple[str, str, Path, str]) -> None:
-    # Module-level so ProcessPoolExecutor can pickle it; the fingerprint lets
-    # render_pdf skip PDFs whose content is unchanged since last run.
-    title, content, output, _fingerprint = payload
-    render_pdf(title, content, output)
+def _render_job(payload: tuple[str, str, Path, str, str]) -> None:
+    # Module-level so ProcessPoolExecutor can pickle it. The fingerprint is
+    # reused instead of hashing the article HTML a second time in this process.
+    title, content, output, fingerprint, source_url = payload
+    render_pdf(title, content, output, fingerprint=fingerprint, source_url=source_url)
 
 
-def generate(master_file: Path, output: Path = Path("Noter"), workers: int | None = None, request_delay: float = 0, log=print) -> int:
+def generate(
+    master_file: Path,
+    output: Path = Path("Noter"),
+    workers: int | None = None,
+    request_delay: float = 0,
+    log=print,
+    *,
+    refresh: bool = False,
+    epub: Path | None = None,
+    prune_output: bool = False,
+) -> int:
     if workers is not None and workers < 1:
         raise ValueError("workers must be at least 1")
     if request_delay < 0:
@@ -39,12 +50,12 @@ def generate(master_file: Path, output: Path = Path("Noter"), workers: int | Non
     def download(url: str):
         started = time.monotonic()
         try:
-            cached = load_processed_article(url, CACHE_DIR)
+            cached = None if refresh else load_processed_article(url, CACHE_DIR)
             if cached is not None:
                 content, links = cached
                 return url, content, links, True, None, time.monotonic() - started
 
-            article_html = fetch_article(url, CACHE_DIR, request_delay)
+            article_html = fetch_article(url, CACHE_DIR, request_delay, refresh=refresh)
             content, links = parse_article(url, article_html)
             store_processed_article(url, content, links, CACHE_DIR)
             return url, content, links, False, None, time.monotonic() - started
@@ -52,19 +63,24 @@ def generate(master_file: Path, output: Path = Path("Noter"), workers: int | Non
             return url, None, set(), False, exc, time.monotonic() - started
 
     with ThreadPoolExecutor(max_workers=fetch_workers) as executor:
+        # A set makes the one-level crawl O(1) per discovered link instead of
+        # scanning every pending future for each link.
+        queued: set[str] = set(root_urls)
         futures: dict[Future, str] = {
-            executor.submit(download, url): url for url in root_urls
+            executor.submit(download, url): url for url in queued
         }
         while futures:
             completed, _ = wait(futures, return_when=FIRST_COMPLETED)
             for future in completed:
                 url = futures.pop(future)
+                queued.discard(url)
                 url, content, links, cache_hit, error, duration = future.result()
-                if cache_hit:
+                cached_failure = isinstance(error, CachedFailure)
+                if cache_hit or cached_failure:
                     stats["cache_hits"] += 1
                 else:
                     stats["requests"] += 1
-                log(f"{'Using cache' if cache_hit else 'Fetched'} {ascii_safe(article_title(url))} ({duration:.1f}s)", flush=True)
+                log(f"{'Using cache' if cache_hit or cached_failure else 'Fetched'} {ascii_safe(article_title(url))} ({duration:.1f}s)", flush=True)
                 if error:
                     if isinstance(error, HTTPError) and error.code == 404:
                         stats["not_found"] += 1
@@ -75,7 +91,8 @@ def generate(master_file: Path, output: Path = Path("Noter"), workers: int | Non
                 pages[url] = (content, links)
                 if url in root_urls:
                     for link in links:
-                        if link not in futures.values() and link not in pages:
+                        if link not in queued and link not in pages:
+                            queued.add(link)
                             futures[executor.submit(download, link)] = link
 
     articles_dir = output / "artikler"
@@ -104,54 +121,117 @@ def generate(master_file: Path, output: Path = Path("Noter"), workers: int | Non
         log(f"Rendered {math_formulas} math formula(s) locally ({time.monotonic() - media_started:.1f}s)", flush=True)
 
     prepared_content: dict[str, str] = {}
+    epub_content: dict[str, str] = {}
 
-    def prepare_one(item: tuple[str, tuple[str, set[str]]]) -> tuple[str, str]:
+    def prepare_one(item: tuple[str, tuple[str, set[str]]]) -> tuple[str, str, str]:
         url, (content, _) = item
         pdf = pdf_by_url[url]
-        linked_content = rewrite_links(math_content[url], pdf_by_url, pdf)
-        return url, prepare_media(linked_content, url, MEDIA_CACHE_DIR)
+        # Keep the media-prepared HTML for EPUB export; PDF link rewriting is
+        # applied only to the copy that goes into the PDF.
+        media_ready = prepare_media(math_content[url], url, MEDIA_CACHE_DIR)
+        return url, rewrite_links(media_ready, pdf_by_url, pdf), media_ready
 
     log(f"Preparing media for {len(jobs)} PDFs with {worker_count} workers...", flush=True)
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {executor.submit(prepare_one, item): item[0] for item in jobs}
         for index, future in enumerate(as_completed(futures), 1):
-            url, rendered_content = future.result()
+            url, rendered_content, media_ready = future.result()
             prepared_content[url] = rendered_content
+            epub_content[url] = media_ready
             log(f"Prepared media {index}/{len(jobs)}: {ascii_safe(page_info[url][0])}", flush=True)
     media_duration = time.monotonic() - media_started
 
     render_started = time.monotonic()
-    render_jobs = [
-        (page_info[url][0], prepared_content[url], pdf_by_url[url], fingerprint_of(page_info[url][0], prepared_content[url]))
-        for url, _ in jobs
-        if not is_current(pdf_by_url[url], page_info[url][0], prepared_content[url])
-    ]
+    render_jobs: list[tuple[str, str, Path, str, str]] = []
+    for url, _ in jobs:
+        title = page_info[url][0]
+        content = prepared_content[url]
+        fingerprint = fingerprint_of(title, content)
+        if not is_current(pdf_by_url[url], title, content, fingerprint=fingerprint):
+            render_jobs.append((title, content, pdf_by_url[url], fingerprint, url))
     skipped = len(jobs) - len(render_jobs)
 
+    # Spawning worker processes costs ~0.5-1s on Windows. Benchmarks showed the
+    # pool only pays off once the batch contains a substantial amount of HTML;
+    # a handful of short articles renders faster in-process.
+    pool_worthwhile = (
+        worker_count > 1
+        and len(render_jobs) > 1
+        and sum(len(job[1]) for job in render_jobs) >= 200_000
+    )
     if render_jobs:
-        log(f"Rendering {len(render_jobs)} PDFs with {worker_count} workers...", flush=True)
+        workers_detail = f" with {min(worker_count, len(render_jobs))} workers" if pool_worthwhile else ""
+        log(f"Rendering {len(render_jobs)} PDF(s){workers_detail}...", flush=True)
     if skipped:
         log(f"Reusing {skipped} unchanged PDF(s).", flush=True)
 
     rendered: dict[str, str] = {}
-    # PDF layout is pure-Python CPU work, so the GIL makes threads useless here;
-    # separate processes are needed for real parallel rendering speedups.
-    try:
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
-            futures = {executor.submit(_render_job, job): job for job in render_jobs}
-            for index, future in enumerate(as_completed(futures), 1):
-                job = futures[future]
-                future.result()
+    if pool_worthwhile:
+        # PDF layout is pure-Python CPU work, so the GIL makes threads useless
+        # here; separate processes are needed for real parallel speedups.
+        try:
+            with ProcessPoolExecutor(max_workers=min(worker_count, len(render_jobs))) as executor:
+                futures = {executor.submit(_render_job, job): job for job in render_jobs}
+                for index, future in enumerate(as_completed(futures), 1):
+                    job = futures[future]
+                    future.result()
+                    rendered[str(job[2].resolve())] = job[3]
+                    log(f"Rendered PDF {index}/{len(render_jobs)}: {ascii_safe(job[0])}", flush=True)
+        except (OSError, ValueError, BrokenProcessPool):
+            # Platforms without a working spawn/fork: fall back to in-process
+            # rendering; the fingerprint cache makes the retry nearly free.
+            for index, job in enumerate(render_jobs, 1):
+                _render_job(job)
                 rendered[str(job[2].resolve())] = job[3]
                 log(f"Rendered PDF {index}/{len(render_jobs)}: {ascii_safe(job[0])}", flush=True)
-    except (OSError, ValueError, BrokenProcessPool):
-        # Platforms without a working spawn/fork: fall back to in-process
-        # rendering; the fingerprint cache makes the retry nearly free.
+    else:
         for index, job in enumerate(render_jobs, 1):
             _render_job(job)
             rendered[str(job[2].resolve())] = job[3]
             log(f"Rendered PDF {index}/{len(render_jobs)}: {ascii_safe(job[0])}", flush=True)
-    save_fingerprints(rendered)
+    if rendered:
+        save_fingerprints(rendered)
+
+    if prune_output:
+        if not pages or stats["failures"]:
+            # A transient network failure must not wipe a previously complete
+            # collection from the output folder.
+            log("Skipping output prune because the run was incomplete.", flush=True)
+        else:
+            produced = {str(path.resolve()) for path in pdf_by_url.values()}
+            removed = 0
+            for existing in articles_dir.glob("*.pdf"):
+                if str(existing.resolve()) not in produced:
+                    existing.unlink(missing_ok=True)
+                    removed += 1
+            stale_fingerprints = prune_fingerprints(produced)
+            if removed:
+                log(f"Removed {removed} orphaned PDF(s) from {articles_dir}.", flush=True)
+            if stale_fingerprints:
+                log(f"Removed {stale_fingerprints} stale render fingerprint(s).", flush=True)
+
+    if epub is not None:
+        if pages:
+            # Keep the book order stable: subject order from the input file, then
+            # followed articles that were not named explicitly. Network completion
+            # order must not leak into the EPUB spine.
+            ordered_urls: list[str] = []
+            seen_urls: set[str] = set()
+            for urls in direct_by_subject.values():
+                for url in sorted((url for url in urls if url in pages), key=lambda item: page_info[item][0].casefold()):
+                    if url not in seen_urls:
+                        ordered_urls.append(url)
+                        seen_urls.add(url)
+            for url in sorted((url for url in pages if url not in seen_urls), key=lambda item: page_info[item][0].casefold()):
+                ordered_urls.append(url)
+            epub_articles = [
+                EpubArticle(url, page_info[url][0], epub_content[url]) for url in ordered_urls
+            ]
+            collection_title = epub.stem or master_file.stem or "Artikler"
+            write_epub(epub, collection_title, epub_articles, direct_by_subject)
+            log(f"Wrote EPUB: {ascii_safe(str(epub))}", flush=True)
+        else:
+            log("No articles were downloaded; skipping EPUB export.", flush=True)
 
     for subject, urls in direct_by_subject.items():
         subject_dir = output / subject

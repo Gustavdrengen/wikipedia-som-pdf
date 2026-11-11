@@ -22,6 +22,10 @@ _PERMANENT_FAILURES = {400, 401, 403, 404, 410, 451}
 _TRANSIENT_FAILURES = {500, 502, 503, 504}
 
 
+class CachedFailure(HTTPError):
+    """A permanent failure served from cache, without a network request."""
+
+
 def canonical_url(url: str) -> str:
     return resolve_canonical_url(url)
 
@@ -100,7 +104,7 @@ def store_processed_article(url: str, content: str, links: set[str], cache_dir: 
             _CACHE_INDEX.popitem(last=False)
 
 
-def fetch_article(url: str, cache_dir: Path = CACHE_DIR, request_delay: float = 1.0) -> str:
+def fetch_article(url: str, cache_dir: Path = CACHE_DIR, request_delay: float = 1.0, *, refresh: bool = False) -> str:
     site = site_for(url)
     if site is None:
         raise ValueError(f"Unsupported site: {url}")
@@ -121,12 +125,14 @@ def fetch_article(url: str, cache_dir: Path = CACHE_DIR, request_delay: float = 
         return result["content"]
     try:
         failure_path = failure_cache_path(url, cache_dir)
-        if _fresh(failure_path):
+        cached_status: int | None = None
+        if not refresh and _fresh(failure_path):
             try:
-                status = json.loads(failure_path.read_text(encoding="utf-8"))["status"]
-                raise HTTPError(url, status, "Cached failure", {}, None)
+                cached_status = int(json.loads(failure_path.read_text(encoding="utf-8"))["status"])
             except (OSError, ValueError, KeyError, TypeError):
-                pass
+                cached_status = None
+        if cached_status is not None:
+            raise CachedFailure(url, cached_status, "Cached failure", {}, None)
         api_url = site.api_url(url)
         retry_waited = 0.0
         for attempt in range(MAX_RETRIES + 1):
@@ -140,6 +146,9 @@ def fetch_article(url: str, cache_dir: Path = CACHE_DIR, request_delay: float = 
                 if not site.accepts_content(content):
                     _write_json(failure_path, {"status": 404})
                     raise HTTPError(url, 404, "Unsupported page type", {}, None)
+                # A forced refresh should clear a still-fresh cached failure so
+                # the next normal run does not fall back into the old error.
+                failure_path.unlink(missing_ok=True)
                 result["content"] = content
                 return content
             except HTTPError as exc:
